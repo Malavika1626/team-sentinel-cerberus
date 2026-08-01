@@ -1,0 +1,586 @@
+"""
+Cerberus — Zero-Trust Access Control with Blast Radius Prediction
+--------------------------------------------------------------------
+Core innovation beyond standard zero-trust proxies:
+  1. Trust Decay      -> trust score drains over time like a battery,
+                          forcing periodic re-verification (shrinks attacker window)
+  2. Blast Radius      -> predicts which services WOULD be compromised next,
+                          BEFORE the attacker actually reaches them (graph propagation)
+  3. Explainable Block -> every allow/block decision returns a human-readable reason
+
+Run:  uvicorn main:app --reload --port 8000
+"""
+
+import time
+import math
+import random
+import asyncio
+import statistics
+from collections import deque
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional
+
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+
+app = FastAPI(title="Cerberus")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ---------------------------------------------------------------------------
+# 1. SERVICE TOPOLOGY  (normal, legitimate call graph — who talks to whom)
+# ---------------------------------------------------------------------------
+# Each edge = (caller -> callee): weight = how "normal" this call pattern is (0-1)
+NORMAL_GRAPH: Dict[str, Dict[str, float]] = {
+    "OrderService":   {"PaymentService": 0.95, "InventoryService": 0.9},
+    "PaymentService": {"BankGateway": 0.9},
+    "InventoryService": {"UserDBService": 0.2},   # rare, low-weight legit edge
+    "UserDBService":  {},
+    "BankGateway":    {},
+}
+
+ALL_SERVICES = list(NORMAL_GRAPH.keys())
+
+# ---------------------------------------------------------------------------
+# 1b. HONEYTOKENS  (decoy services — NO legitimate service should ever call these)
+# ---------------------------------------------------------------------------
+# Any request that targets one of these is, by definition, malicious —
+# a legit service was never told these exist, so touching them = 100% signal.
+HONEYTOKEN_SERVICES = {"AdminBackdoor_DB", "LegacyPaymentVault", "InternalHR_Records"}
+
+honeytoken_hits: List[dict] = []
+
+# ---------------------------------------------------------------------------
+# 2. TRUST STATE  (the "battery" — decays continuously, recharges on verify)
+# ---------------------------------------------------------------------------
+@dataclass
+class ServiceTrust:
+    name: str
+    score: float = 100.0          # 0-100, battery-style
+    compromised: bool = False
+    last_verified: float = field(default_factory=time.time)
+    quarantined: bool = False
+    quarantined_until: float = 0.0
+
+    def decay(self, dt: float):
+        # exponential decay -> trust drains faster the longer it goes unverified
+        decay_rate = 0.15  # % per second
+        self.score = max(0.0, self.score - decay_rate * dt)
+
+    def recharge(self, amount: float = 25.0):
+        self.score = min(100.0, self.score + amount)
+        self.last_verified = time.time()
+
+
+trust_state: Dict[str, ServiceTrust] = {s: ServiceTrust(s) for s in ALL_SERVICES}
+
+event_log: deque = deque(maxlen=200)
+connected_sockets: List[WebSocket] = []
+
+# ---------------------------------------------------------------------------
+# 2b. QUARANTINE COOLDOWN (feature 4: self-healing micro-segmentation)
+# ---------------------------------------------------------------------------
+QUARANTINE_COOLDOWN_SECONDS = 20.0
+QUARANTINE_RECOVERY_TRUST = 50.0
+
+# ---------------------------------------------------------------------------
+# 2c. BEHAVIORAL FINGERPRINT baseline (feature 3)
+# ---------------------------------------------------------------------------
+BASELINE_WINDOW = 30
+payload_baselines: Dict[str, deque] = {s: deque(maxlen=BASELINE_WINDOW) for s in ALL_SERVICES}
+
+# ---------------------------------------------------------------------------
+# 2d. RISK-ADAPTIVE RATE LIMITING state (feature 5)
+# ---------------------------------------------------------------------------
+RATE_WINDOW_SECONDS = 10.0
+request_timestamps: Dict[str, deque] = {s: deque() for s in ALL_SERVICES}
+
+
+def log_event(kind: str, message: str, extra: Optional[dict] = None):
+    entry = {
+        "ts": round(time.time(), 2),
+        "kind": kind,       # "allow" | "block" | "info" | "attack"
+        "message": message,
+        **(extra or {}),
+    }
+    event_log.append(entry)
+    return entry
+
+
+# ---------------------------------------------------------------------------
+# 3. TRUST DECAY LOOP  (background task — the "battery drains" over time)
+# ---------------------------------------------------------------------------
+async def decay_loop():
+    last = time.time()
+    while True:
+        await asyncio.sleep(1)
+        now = time.time()
+        dt = now - last
+        last = now
+        for svc in trust_state.values():
+            if not svc.compromised:
+                svc.decay(dt)
+        await broadcast_state()
+
+
+def quarantine_service(name: str, reason: str, cooldown: float = QUARANTINE_COOLDOWN_SECONDS):
+    """Isolate a service: block all its outbound traffic for `cooldown` seconds."""
+    svc = trust_state.get(name)
+    if not svc:
+        return
+    svc.quarantined = True
+    svc.quarantined_until = time.time() + cooldown
+    log_event(
+        "attack",
+        f"🔒 {name} QUARANTINED for {int(cooldown)}s — {reason}",
+        {"service": name, "quarantined_until": svc.quarantined_until},
+    )
+
+
+async def quarantine_watchdog():
+    """Background loop: auto-lifts quarantine after cooldown, restores cautious mid-trust."""
+    while True:
+        await asyncio.sleep(1)
+        now = time.time()
+        changed = False
+        for svc in trust_state.values():
+            if svc.quarantined and now >= svc.quarantined_until:
+                svc.quarantined = False
+                svc.compromised = False
+                svc.score = QUARANTINE_RECOVERY_TRUST
+                svc.last_verified = now
+                log_event(
+                    "info",
+                    f"♻ {svc.name} auto-healed — quarantine lifted, trust restored to {QUARANTINE_RECOVERY_TRUST:.0f} (cautious mid-level)",
+                    {"service": svc.name},
+                )
+                changed = True
+        if changed:
+            await broadcast_state()
+
+
+async def broadcast_state():
+    if not connected_sockets:
+        return
+    payload = build_state_payload()
+    dead = []
+    for ws in connected_sockets:
+        try:
+            await ws.send_json(payload)
+        except Exception:
+            dead.append(ws)
+    for d in dead:
+        connected_sockets.remove(d)
+
+
+def build_state_payload():
+    now = time.time()
+    services_payload = {}
+    for name, s in trust_state.items():
+        q = request_timestamps.get(name, deque())
+        # count only requests still inside the sliding window, without mutating state
+        active_count = sum(1 for ts in q if now - ts <= RATE_WINDOW_SECONDS)
+        baseline = payload_baselines.get(name, deque())
+        services_payload[name] = {
+            "score": round(s.score, 1),
+            "compromised": s.compromised,
+            "quarantined": s.quarantined,
+            "quarantine_remaining": round(max(0.0, s.quarantined_until - now), 1) if s.quarantined else 0,
+            "rate_limit": {
+                "count": active_count,
+                "limit": get_rate_limit_for_trust(s.score),
+                "window_seconds": RATE_WINDOW_SECONDS,
+            },
+            "fingerprint": {
+                "sample_count": len(baseline),
+                "baseline_ready": len(baseline) >= 5,
+                "avg_payload": round(statistics.mean(baseline), 0) if baseline else None,
+            },
+        }
+    return {
+        "type": "state",
+        "services": services_payload,
+        "edges": [
+            {"from": src, "to": dst, "weight": w}
+            for src, targets in NORMAL_GRAPH.items()
+            for dst, w in targets.items()
+        ],
+        "log": list(event_log)[-30:],
+        "honeytokens": list(HONEYTOKEN_SERVICES),
+        "honeytoken_hit_count": len(honeytoken_hits),
+    }
+
+
+@app.on_event("startup")
+async def startup():
+    asyncio.create_task(decay_loop())
+    asyncio.create_task(quarantine_watchdog())
+
+
+# ---------------------------------------------------------------------------
+# 4. CONTEXTUAL ANOMALY SCORING  (time / pattern / payload heuristics)
+# ---------------------------------------------------------------------------
+def context_anomaly_score(caller: str, callee: str, payload_size: int, hour: int) -> float:
+    """Returns 0 (totally normal) -> 1 (highly anomalous)."""
+    score = 0.0
+    reasons = []
+
+    # 1. Is this even a known/legit edge?
+    legit_weight = NORMAL_GRAPH.get(caller, {}).get(callee)
+    if legit_weight is None:
+        score += 0.6
+        reasons.append(f"no known trust relationship {caller}->{callee}")
+    elif legit_weight < 0.3:
+        score += 0.25
+        reasons.append(f"rare edge (baseline weight {legit_weight})")
+
+    # 2. Odd hour (outside 6am-10pm "business" simulation window)
+    if hour < 6 or hour > 22:
+        score += 0.2
+        reasons.append(f"off-hours request ({hour}:00)")
+
+    # 3. Payload size anomaly (large scrape-like payloads)
+    if payload_size > 5000:
+        score += 0.25
+        reasons.append(f"unusually large payload ({payload_size} bytes)")
+
+    return min(1.0, score), reasons
+
+
+# ---------------------------------------------------------------------------
+# 4b. BEHAVIORAL FINGERPRINT VERIFICATION  (feature 3 — payload z-score baseline)
+# ---------------------------------------------------------------------------
+def behavioral_deviation_score(caller: str, payload_size: int):
+    """
+    Compares payload_size against the caller's rolling baseline (last 30 allowed
+    calls) using a z-score. Catches stolen-but-valid-token attacks where identity
+    checks pass but behavior doesn't match the service's normal fingerprint.
+    Returns (extra_anomaly_score 0-1, human-readable reason or None).
+    """
+    baseline = payload_baselines.get(caller)
+    if baseline is None or len(baseline) < 5:
+        return 0.0, None  # not enough history yet to judge deviation
+
+    mean = statistics.mean(baseline)
+    stdev = statistics.pstdev(baseline) or 1.0  # avoid divide-by-zero for flat baselines
+    z = (payload_size - mean) / stdev
+
+    if abs(z) > 3:
+        return 0.35, f"payload fingerprint deviation z={z:.1f} (baseline avg {mean:.0f}B) — severe"
+    elif abs(z) > 2:
+        return 0.2, f"payload fingerprint deviation z={z:.1f} (baseline avg {mean:.0f}B)"
+    return 0.0, None
+
+
+def record_baseline(caller: str, payload_size: int):
+    """Only ALLOWED calls feed the baseline, so poisoning the fingerprint is harder."""
+    if caller in payload_baselines:
+        payload_baselines[caller].append(payload_size)
+
+
+# ---------------------------------------------------------------------------
+# 4c. RISK-ADAPTIVE RATE LIMITING  (feature 5 — sliding window tied to trust)
+# ---------------------------------------------------------------------------
+def get_rate_limit_for_trust(trust_score: float) -> int:
+    if trust_score >= 80:
+        return 20
+    elif trust_score >= 50:
+        return 10
+    elif trust_score >= 20:
+        return 3
+    else:
+        return 1
+
+
+def check_rate_limit(caller: str, trust_score: float):
+    """
+    Sliding 10s window. Limit shrinks as trust drops, so bulk-scraping behavior
+    gets throttled gradually instead of only reacting after full compromise.
+    Returns (allowed: bool, current_count: int, limit: int).
+    """
+    now = time.time()
+    q = request_timestamps.setdefault(caller, deque())
+    while q and now - q[0] > RATE_WINDOW_SECONDS:
+        q.popleft()
+
+    limit = get_rate_limit_for_trust(trust_score)
+    allowed = len(q) < limit
+    if allowed:
+        q.append(now)
+    return allowed, len(q), limit
+
+
+# ---------------------------------------------------------------------------
+# 5. BLAST RADIUS PREDICTION  (graph propagation from a compromised node)
+# ---------------------------------------------------------------------------
+def predict_blast_radius(compromised: str, max_hops: int = 2) -> List[dict]:
+    """
+    BFS outward from the compromised service through the legitimate call graph.
+    Risk decays with hop distance and edge weight -- this is what lets us
+    warn 'these N services are likely next' BEFORE the attacker gets there.
+    """
+    visited = {compromised: 1.0}
+    frontier = [(compromised, 1.0, 0)]
+    results = []
+
+    while frontier:
+        node, risk, hop = frontier.pop(0)
+        if hop >= max_hops:
+            continue
+        for neighbor, weight in NORMAL_GRAPH.get(node, {}).items():
+            propagated_risk = risk * weight * (0.7 ** hop)  # decay per hop
+            if neighbor not in visited or propagated_risk > visited[neighbor]:
+                visited[neighbor] = propagated_risk
+                frontier.append((neighbor, propagated_risk, hop + 1))
+                results.append({
+                    "service": neighbor,
+                    "predicted_risk": round(propagated_risk * 100, 1),
+                    "hops_away": hop + 1,
+                    "via": node,
+                })
+    return sorted(results, key=lambda r: -r["predicted_risk"])
+
+
+# ---------------------------------------------------------------------------
+# 6. API MODELS
+# ---------------------------------------------------------------------------
+class ProxyRequest(BaseModel):
+    caller: str
+    callee: str
+    payload_size: int = 200
+    hour: Optional[int] = None
+
+
+class AttackSimRequest(BaseModel):
+    compromised_service: str
+
+
+# ---------------------------------------------------------------------------
+# 7. CORE ENDPOINT — every inter-service call passes through here
+# ---------------------------------------------------------------------------
+@app.post("/proxy/request")
+async def proxy_request(req: ProxyRequest):
+    """
+    Every inter-service call passes through here. Checked in strict priority
+    order: quarantine -> honeytoken -> context anomaly -> behavioral fingerprint
+    -> rate limit -> final trust-threshold decision.
+    """
+    caller = trust_state.get(req.caller)
+
+    # --- LAYER 1: QUARANTINE CHECK (feature 4 — highest priority, no ambiguity) ---
+    if caller and caller.quarantined:
+        remaining = max(0, round(caller.quarantined_until - time.time(), 1))
+        reason = f"{req.caller} is QUARANTINED — all outbound traffic blocked ({remaining}s remaining in cooldown)"
+        log_event(
+            "block",
+            f"{req.caller} -> {req.callee}: BLOCK (quarantined)",
+            {"caller": req.caller, "callee": req.callee, "reason": reason},
+        )
+        await broadcast_state()
+        return {"decision": "block", "reason": reason, "anomaly_score": 1.0, "trust": 0, "quarantine_remaining": remaining}
+
+    # --- LAYER 2: HONEYTOKEN CHECK (zero ambiguity signal) ---
+    if req.callee in HONEYTOKEN_SERVICES:
+        hit = {
+            "ts": time.time(),
+            "attacker": req.caller,
+            "honeytoken": req.callee,
+        }
+        honeytoken_hits.append(hit)
+        # touching a honeytoken instantly zeroes the caller's trust and quarantines it —
+        # no legit service would ever know this endpoint exists
+        if caller:
+            caller.score = 0
+            caller.compromised = True
+            quarantine_service(req.caller, f"honeytoken '{req.callee}' triggered")
+        log_event(
+            "attack",
+            f"🍯 HONEYTOKEN TRIGGERED: {req.caller} touched decoy '{req.callee}' — 100% confirmed malicious",
+            {"caller": req.caller, "callee": req.callee, "reason": "honeytoken access — no legitimate service is aware this endpoint exists"},
+        )
+        await broadcast_state()
+        return {
+            "decision": "block",
+            "reason": f"HONEYTOKEN TRIGGERED — {req.caller} accessed decoy service '{req.callee}'. Confidence: 100% malicious. Auto-quarantined.",
+            "anomaly_score": 1.0,
+            "trust": 0,
+        }
+
+    callee = trust_state.get(req.callee)
+    if not caller or not callee:
+        return {"decision": "block", "reason": "unknown service"}
+
+    # --- LAYER 3: CONTEXTUAL ANOMALY SCORING ---
+    hour = req.hour if req.hour is not None else time.localtime().tm_hour
+    anomaly, reasons = context_anomaly_score(req.caller, req.callee, req.payload_size, hour)
+
+    # --- LAYER 4: BEHAVIORAL FINGERPRINT VERIFICATION ---
+    behavior_extra, behavior_reason = behavioral_deviation_score(req.caller, req.payload_size)
+    if behavior_reason:
+        anomaly = min(1.0, anomaly + behavior_extra)
+        reasons.append(behavior_reason)
+
+    # --- LAYER 5: RISK-ADAPTIVE RATE LIMITING ---
+    rl_allowed, rl_count, rl_limit = check_rate_limit(req.caller, caller.score)
+    if not rl_allowed:
+        reason = f"Blocked: rate limit exceeded ({rl_count}/{rl_limit} req in {int(RATE_WINDOW_SECONDS)}s window at trust {caller.score:.0f})"
+        if caller.score < 20:
+            quarantine_service(req.caller, "sustained rate-limit violations at critically low trust")
+        log_event(
+            "block",
+            f"{req.caller} -> {req.callee}: BLOCK (rate limited)",
+            {"caller": req.caller, "callee": req.callee, "reason": reason},
+        )
+        await broadcast_state()
+        return {"decision": "block", "reason": reason, "anomaly_score": anomaly, "trust": round(caller.score, 1),
+                "rate_limit": {"count": rl_count, "limit": rl_limit}}
+
+    # --- LAYER 6: FINAL TRUST-THRESHOLD DECISION ---
+    effective_trust = caller.score * (1 - anomaly)
+
+    if caller.compromised:
+        decision = "block"
+        reason = f"{req.caller} is flagged compromised — all outbound traffic blocked"
+    elif effective_trust < 40:
+        decision = "block"
+        reason = "Blocked: trust score too low (" + f"{effective_trust:.1f}" + ") — " + "; ".join(reasons or ["battery depleted, re-auth required"])
+    else:
+        decision = "allow"
+        caller.recharge(10)  # successful legit call recharges trust slightly
+        record_baseline(req.caller, req.payload_size)  # only allowed calls feed the fingerprint
+        reason = f"Allowed: trust {effective_trust:.1f}/100, anomaly {anomaly:.2f}"
+
+    # Self-healing micro-segmentation: trust collapsing below critical threshold => quarantine
+    if decision == "block" and caller.score <= 20 and not caller.quarantined:
+        quarantine_service(req.caller, f"trust collapsed to {caller.score:.0f} (below critical threshold)")
+
+    log_event(
+        decision,
+        f"{req.caller} -> {req.callee}: {decision.upper()}",
+        {"caller": req.caller, "callee": req.callee, "reason": reason, "anomaly": round(anomaly, 2)},
+    )
+    await broadcast_state()
+    return {
+        "decision": decision,
+        "reason": reason,
+        "anomaly_score": anomaly,
+        "trust": round(effective_trust, 1),
+        "rate_limit": {"count": rl_count, "limit": rl_limit},
+        "behavioral_flag": behavior_reason,
+    }
+
+
+@app.post("/verify/{service}")
+async def verify_service(service: str):
+    """Manual re-authentication -> recharges the trust battery."""
+    svc = trust_state.get(service)
+    if not svc:
+        return {"error": "unknown service"}
+    svc.recharge(100)
+    svc.compromised = False
+    svc.quarantined = False
+    svc.quarantined_until = 0.0
+    log_event("info", f"{service} re-verified — trust recharged to 100")
+    await broadcast_state()
+    return {"service": service, "score": svc.score}
+
+
+@app.post("/simulate/attack")
+async def simulate_attack(req: AttackSimRequest):
+    """
+    Marks a service as compromised, then predicts blast radius BEFORE
+    the attacker actually issues any lateral-movement requests.
+    """
+    svc = trust_state.get(req.compromised_service)
+    if not svc:
+        return {"error": "unknown service"}
+
+    svc.compromised = True
+    svc.score = min(svc.score, 20)  # compromise tanks trust immediately
+    quarantine_service(req.compromised_service, "attack simulation confirmed compromise")
+
+    radius = predict_blast_radius(req.compromised_service)
+
+    log_event(
+        "attack",
+        f"⚠ {req.compromised_service} COMPROMISED — predicted blast radius: "
+        + ", ".join(r["service"] for r in radius) if radius else f"⚠ {req.compromised_service} COMPROMISED — no reachable neighbors",
+        {"blast_radius": radius},
+    )
+    await broadcast_state()
+
+    # Now actually attempt lateral movement calls to prove the block works
+    lateral_results = []
+    for r in radius:
+        result = await proxy_request(ProxyRequest(
+            caller=req.compromised_service,
+            callee=r["service"],
+            payload_size=8000,   # scrape-like payload
+            hour=3,              # off hours
+        ))
+        lateral_results.append({"target": r["service"], **result})
+
+    return {
+        "compromised": req.compromised_service,
+        "blast_radius": radius,
+        "lateral_movement_attempts": lateral_results,
+    }
+
+
+@app.post("/simulate/honeytoken_probe")
+async def simulate_honeytoken_probe(req: AttackSimRequest):
+    """
+    Demo endpoint: an already-compromised service tries to scan/discover
+    internal endpoints and stumbles onto a honeytoken. Shows the trap
+    working in isolation (separate from the full blast-radius attack demo).
+    """
+    decoy = random.choice(list(HONEYTOKEN_SERVICES))
+    result = await proxy_request(ProxyRequest(
+        caller=req.compromised_service,
+        callee=decoy,
+        payload_size=1500,
+        hour=3,
+    ))
+    return {"probed_honeytoken": decoy, **result}
+
+
+@app.post("/reset")
+async def reset():
+    for s in trust_state.values():
+        s.score = 100.0
+        s.compromised = False
+        s.quarantined = False
+        s.quarantined_until = 0.0
+    for baseline in payload_baselines.values():
+        baseline.clear()
+    for q in request_timestamps.values():
+        q.clear()
+    event_log.clear()
+    honeytoken_hits.clear()
+    log_event("info", "System reset — all services re-verified")
+    await broadcast_state()
+    return {"status": "reset"}
+
+
+@app.get("/state")
+async def get_state():
+    return build_state_payload()
+
+
+@app.websocket("/ws")
+async def ws_endpoint(websocket: WebSocket):
+    await websocket.accept()
+    connected_sockets.append(websocket)
+    await websocket.send_json(build_state_payload())
+    try:
+        while True:
+            await websocket.receive_text()  # keep-alive; client doesn't need to send real data
+    except WebSocketDisconnect:
+        if websocket in connected_sockets:
+            connected_sockets.remove(websocket)
