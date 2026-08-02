@@ -5,7 +5,7 @@ Core innovation beyond standard zero-trust proxies:
   1. Trust Decay      -> trust score drains over time like a battery,
                           forcing periodic re-verification (shrinks attacker window)
   2. Blast Radius      -> predicts which services WOULD be compromised next,
-                          BEFORE the attacker actually reaches them (graph propagation) 
+                          BEFORE the attacker actually reaches them (graph propagation)
   3. Explainable Block -> every allow/block decision returns a human-readable reason
 
 Run:  uvicorn main:app --reload --port 8000
@@ -68,10 +68,12 @@ app.add_middleware(
 _DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
 
 
-@app.get("/")
+@app.api_route("/", methods=["GET", "HEAD"])
 def serve_dashboard():
     """Serve the dashboard UI at the site root, so one deployed URL covers both
-    the API and the frontend (no separate static hosting / CORS setup needed)."""
+    the API and the frontend (no separate static hosting / CORS setup needed).
+    Accepts HEAD too, since uptime monitors (e.g. UptimeRobot) often ping with
+    HEAD requests — a GET-only route would 405 those and get falsely marked down."""
     return FileResponse(_DASHBOARD_PATH)
 
 
