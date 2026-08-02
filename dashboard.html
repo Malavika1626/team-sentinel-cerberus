@@ -1,0 +1,688 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>Cerberus — Zero-Trust Dashboard</title>
+<style>
+  :root {
+    --bg: #0d0818;
+    --panel: #1a1030;
+    --border: #3a2560;
+    --text: #ede9f7;
+    --muted: #a494c9;
+    --green: #3ddc84;
+    --red: #ff4d6e;
+    --amber: #ffb454;
+    --blue: #a855f7;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: radial-gradient(ellipse at top, #1a0f33 0%, #0d0818 60%);
+    color: var(--text);
+    display: flex;
+    height: 100vh;
+    overflow: hidden;
+  }
+  #left {
+    flex: 2;
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow: hidden;
+  }
+  #right {
+    flex: 1;
+    min-width: 340px;
+    max-width: 420px;
+    border-left: 1px solid var(--border);
+    padding: 20px;
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+    overflow-y: auto;
+  }
+  h1 { font-size: 18px; margin: 0 0 4px 0; }
+  .subtitle { color: var(--muted); font-size: 13px; margin-bottom: 8px; }
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px;
+  }
+  #graph-panel { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+  svg { flex: 1; width: 100%; }
+  .node-circle { stroke-width: 2; transition: all 0.3s ease; }
+  .node-label { fill: var(--text); font-size: 12px; text-anchor: middle; font-weight: 600; }
+  .node-score { fill: var(--muted); font-size: 10px; text-anchor: middle; }
+  .edge-line { stroke: #4a2f7a; stroke-width: 1.5; fill: none; }
+  .controls { display: flex; gap: 8px; flex-wrap: wrap; }
+  select, button {
+    background: #241640;
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 8px 12px;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  button.attack { background: var(--red); border-color: var(--red); color: #fff; font-weight: 600; }
+  button.reset { background: transparent; border-color: var(--muted); color: var(--muted); }
+  button:hover { filter: brightness(1.15); }
+  .trust-row { display: flex; align-items: center; gap: 10px; margin-bottom: 10px; font-size: 13px; }
+  .trust-name { width: 120px; flex-shrink: 0; }
+  .trust-bar-bg { flex: 1; background: #241640; border-radius: 4px; height: 10px; overflow: hidden; }
+  .trust-bar-fill { height: 100%; border-radius: 4px; transition: width 0.3s ease, background 0.3s ease; }
+  #blast-panel { display: none; }
+  #blast-panel.show { display: block; }
+  .blast-item { font-size: 12px; padding: 6px 0; border-bottom: 1px solid var(--border); }
+  #log-panel { flex: 1; min-height: 0; display: flex; flex-direction: column; }
+  #log-list { flex: 1; overflow-y: auto; font-size: 12px; font-family: 'Consolas', monospace; }
+  .log-entry { padding: 5px 8px; border-radius: 4px; margin-bottom: 4px; }
+  .log-allow { background: rgba(61,220,132,0.08); color: var(--green); }
+  .log-block { background: rgba(255,77,94,0.08); color: var(--red); }
+  .log-attack { background: rgba(255,180,84,0.12); color: var(--amber); font-weight: 600; }
+  .log-info { color: var(--muted); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px; font-size: 11px; font-weight: 600; }
+  .badge-ok { background: rgba(61,220,132,0.15); color: var(--green); }
+  .badge-warn { background: rgba(255,77,94,0.15); color: var(--red); }
+
+  /* Honeytoken panel */
+  #honeytoken-panel { border-color: #4a3010; }
+  #honeytoken-panel .panel-header { display: flex; justify-content: space-between; align-items: center; }
+  #honeytoken-count {
+    background: var(--amber); color: #1a1200; font-weight: 700;
+    border-radius: 12px; padding: 2px 10px; font-size: 13px;
+  }
+  .decoy-list { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }
+  .decoy-chip {
+    background: rgba(255,180,84,0.1); border: 1px dashed var(--amber);
+    color: var(--amber); font-size: 11px; padding: 4px 8px; border-radius: 6px;
+    font-family: 'Consolas', monospace;
+  }
+  .honeytoken-hit {
+    background: rgba(255,77,94,0.12); border-left: 3px solid var(--red);
+    padding: 8px 10px; border-radius: 4px; font-size: 12px; margin-top: 8px;
+  }
+  button.honeytoken-btn { background: var(--amber); border-color: var(--amber); color: #1a1200; font-weight: 600; }
+
+  /* Ask-Cerberus chat panel */
+  #ask-messages { margin-top: 10px; max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
+  .ask-bubble { padding: 8px 10px; border-radius: 8px; font-size: 12px; line-height: 1.4; white-space: pre-wrap; }
+  .ask-bubble.user { background: #2a1a4a; align-self: flex-end; max-width: 90%; }
+  .ask-bubble.agent { background: #14203a; border: 1px solid var(--border); }
+  .ask-bubble.loading { color: var(--muted); font-style: italic; }
+
+  /* Service detail panel: rate limit + fingerprint + quarantine */
+  .svc-card {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 12px;
+    margin-bottom: 10px;
+    background: #150c28;
+  }
+  .svc-card.quarantined { border-color: var(--red); background: rgba(255,77,94,0.06); }
+  .svc-card-header { display: flex; justify-content: space-between; align-items: center; font-size: 13px; font-weight: 600; }
+  .svc-sub { font-size: 11px; color: var(--muted); margin-top: 6px; display: flex; justify-content: space-between; }
+  .rl-bar-bg { background: #241640; border-radius: 4px; height: 6px; overflow: hidden; margin-top: 3px; }
+  .rl-bar-fill { height: 100%; border-radius: 4px; background: var(--blue); transition: width 0.3s ease, background 0.3s ease; }
+  .rl-bar-fill.rl-tight { background: var(--amber); }
+  .rl-bar-fill.rl-full { background: var(--red); }
+  .fp-badge {
+    display: inline-block; font-size: 10px; padding: 1px 6px; border-radius: 8px;
+    background: rgba(91,140,255,0.15); color: var(--blue); margin-left: 6px;
+  }
+  .fp-badge.fp-warming { background: rgba(139,147,167,0.15); color: var(--muted); }
+  .quarantine-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    font-size: 11px; font-weight: 700; color: var(--red);
+    background: rgba(255,77,94,0.15); padding: 2px 8px; border-radius: 10px;
+  }
+
+  /* AI/ML upgrade layer panel */
+  #ml-panel { border-color: #2a4a6a; }
+  #ml-panel b.section { display:block; margin-top:14px; margin-bottom:6px; font-size:12px; color:var(--blue); }
+  #ml-panel b.section:first-child { margin-top:0; }
+  .ml-tag {
+    display:inline-block; font-size:10px; padding:1px 6px; border-radius:8px;
+    background: rgba(91,140,255,0.15); color: var(--blue); margin-left:6px; font-weight:600;
+  }
+  .radius-compare { display:flex; gap:10px; }
+  .radius-col { flex:1; min-width:0; }
+  .radius-col-title { font-size:11px; color:var(--muted); margin-bottom:4px; }
+  .radius-item { font-size:11px; padding:4px 6px; border-bottom:1px solid var(--border); }
+  .radius-item b { color: var(--text); }
+  .synth-result { font-size:12px; margin-top:8px; }
+  .synth-summary { display:flex; gap:10px; margin-bottom:6px; }
+  .synth-badge { padding:2px 8px; border-radius:10px; font-size:11px; font-weight:700; }
+  .synth-badge.blocked { background: rgba(255,77,94,0.15); color: var(--red); }
+  .synth-badge.allowed { background: rgba(61,220,132,0.15); color: var(--green); }
+  .synth-item { font-size:11px; padding:3px 0; color: var(--muted); }
+  .synth-item .decision-block { color: var(--red); font-weight:600; }
+  .synth-item .decision-allow { color: var(--green); font-weight:600; }
+  .explain-bar-row { margin-bottom:6px; }
+  .explain-bar-label { display:flex; justify-content:space-between; font-size:11px; margin-bottom:2px; }
+  .explain-bar-bg { background:#241640; border-radius:4px; height:8px; overflow:hidden; }
+  .explain-bar-fill { height:100%; background: var(--blue); border-radius:4px; }
+  #summary-box { font-size:12px; line-height:1.5; color: var(--text); margin-top:6px; }
+  #summary-counts { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
+  .count-chip { font-size:10px; padding:2px 7px; border-radius:8px; background:#241640; color:var(--muted); }
+
+  /* Health score card */
+  #health-panel { display:flex; align-items:center; gap:16px; }
+  #health-score-ring { flex-shrink:0; }
+  #health-metrics { flex:1; display:flex; flex-direction:column; gap:6px; }
+  .health-metric-row { display:flex; justify-content:space-between; font-size:12px; }
+  .health-metric-row b { color: var(--text); }
+
+  /* Compare mode toggle */
+  .toggle-row { display:flex; align-items:center; justify-content:space-between; margin-top:10px; }
+  .switch { position:relative; width:42px; height:22px; flex-shrink:0; }
+  .switch input { opacity:0; width:0; height:0; }
+  .slider { position:absolute; cursor:pointer; inset:0; background:#3a2560; border-radius:22px; transition:.2s; }
+  .slider::before { content:""; position:absolute; height:16px; width:16px; left:3px; top:3px; background:#fff; border-radius:50%; transition:.2s; }
+  input:checked + .slider { background: var(--blue); }
+  input:checked + .slider::before { transform: translateX(20px); }
+  #compare-mode-label { font-size:11px; color:var(--muted); margin-top:4px; }
+
+  /* Export button */
+  button.export-btn { background: transparent; border-color: var(--blue); color: var(--blue); }
+</style>
+</head>
+<body>
+
+<div id="left">
+  <div>
+    <h1>🛡 Cerberus — Zero-Trust Proxy with Blast Radius Prediction</h1>
+    <div class="subtitle">Live inter-service trust graph · trust decays like a battery · attacks predicted before they spread</div>
+  </div>
+
+  <div class="panel" id="health-panel">
+    <svg id="health-score-ring" width="72" height="72" viewBox="0 0 72 72">
+      <circle cx="36" cy="36" r="30" fill="none" stroke="#241640" stroke-width="8"/>
+      <circle id="health-ring-fill" cx="36" cy="36" r="30" fill="none" stroke="var(--green)" stroke-width="8"
+              stroke-dasharray="188.5" stroke-dashoffset="0" stroke-linecap="round" transform="rotate(-90 36 36)"/>
+      <text id="health-score-text" x="36" y="41" text-anchor="middle" font-size="18" font-weight="700" fill="var(--text)">--</text>
+    </svg>
+    <div id="health-metrics">
+      <div class="health-metric-row"><span>Avg. Trust Score</span><b id="health-avg-trust">--</b></div>
+      <div class="health-metric-row"><span>Attacks Defended</span><b id="health-attacks">--</b></div>
+      <div class="health-metric-row"><span>Requests Blocked</span><b id="health-blocked">--</b></div>
+      <div class="health-metric-row"><span>Honeytoken Hits</span><b id="health-honeytoken">--</b></div>
+    </div>
+  </div>
+
+  <div class="panel graph-panel" id="graph-panel">
+    <svg id="graph" viewBox="0 0 800 420"></svg>
+  </div>
+
+  <div class="panel" id="blast-panel">
+    <b style="color:var(--red)">⚠ Predicted Blast Radius</b>
+    <span class="ml-tag">rule-based vs learned (RandomForest)</span>
+    <div class="radius-compare">
+      <div class="radius-col">
+        <div class="radius-col-title">Rule-based (formula)</div>
+        <div id="blast-list"></div>
+      </div>
+      <div class="radius-col">
+        <div class="radius-col-title">ML-predicted (learned)</div>
+        <div id="blast-list-ml"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="right">
+  <div class="panel">
+    <b>Controls</b>
+    <div class="controls" style="margin-top:10px;">
+      <select id="attack-target"></select>
+      <button class="attack" onclick="simulateAttack()">Simulate Attack</button>
+    </div>
+    <div class="controls" style="margin-top:8px;">
+      <button onclick="sendNormalTraffic()">Send Normal Traffic</button>
+      <button class="honeytoken-btn" onclick="simulateHoneytokenProbe()">Probe Honeytoken 🍯</button>
+      <button class="reset" onclick="resetSystem()">Reset</button>
+    </div>
+    <div class="toggle-row">
+      <div>
+        <b style="font-size:13px;">🧪 Compare Mode</b>
+        <div id="compare-mode-label">AI behavioral layer: <span id="compare-mode-state">ON</span></div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="compare-mode-toggle" checked onchange="toggleCompareMode()">
+        <span class="slider"></span>
+      </label>
+    </div>
+    <div class="controls" style="margin-top:10px;">
+      <button class="export-btn" onclick="exportReport()">⬇ Export Incident Report (JSON)</button>
+    </div>
+  </div>
+
+  <div class="panel" id="honeytoken-panel">
+    <div class="panel-header">
+      <b>🍯 Honeytoken Traps</b>
+      <span id="honeytoken-count">0 hits</span>
+    </div>
+    <div style="font-size:12px; color:var(--muted); margin-top:6px;">
+      Decoy endpoints — no legitimate service knows these exist. Any touch = 100% confirmed attacker.
+    </div>
+    <div class="decoy-list" id="decoy-list"></div>
+    <div id="honeytoken-hits"></div>
+  </div>
+
+  <div class="panel">
+    <b>Service Trust · Rate Limit · Fingerprint</b>
+    <div id="trust-bars" style="margin-top:12px;"></div>
+  </div>
+
+  <div class="panel" id="log-panel">
+    <b>Live Event Log</b>
+    <div id="log-list" style="margin-top:10px;"></div>
+  </div>
+
+  <div class="panel" id="ml-panel">
+    <b>🧠 AI / Data-Science Upgrade Layer</b>
+    <div style="font-size:11px; color:var(--muted); margin-top:4px;">
+      Additive learned layers on top of the rule-based core — nothing here changes the base decision path.
+    </div>
+
+    <b class="section">Synthetic Adversarial Traffic Generator</b>
+    <div class="controls">
+      <button onclick="fireSyntheticAttack()">🔥 Fire Attack Burst (6 requests)</button>
+    </div>
+    <div id="synth-result" class="synth-result"></div>
+
+    <b class="section">Explainable Quarantine Decisions <span class="ml-tag">SHAP</span></b>
+    <div class="controls">
+      <button onclick="explainSelectedService()">🔍 Explain Selected Service</button>
+    </div>
+    <div id="explain-result"></div>
+
+    <b class="section">Live Digest <span class="ml-tag">no LLM needed</span></b>
+    <div class="controls">
+      <button onclick="refreshSummary()">↻ Refresh Summary</button>
+    </div>
+    <div id="summary-box">Click refresh to generate a digest of recent activity.</div>
+    <div id="summary-counts"></div>
+  </div>
+
+  <div class="panel" id="ask-panel">
+    <b>🤖 Ask Cerberus <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="ask-messages"></div>
+    <div style="display:flex; gap:6px; margin-top:8px;">
+      <input id="ask-input" type="text" placeholder="Why was OrderService quarantined?"
+             style="flex:1; background:#0d0818; border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px; font-size:12px;"
+             onkeydown="if(event.key==='Enter') askCerberus();">
+      <button onclick="askCerberus()">Ask</button>
+    </div>
+  </div>
+</div>
+
+<script>
+const API = "http://localhost:8000";
+let state = { services: {}, edges: [], log: [], honeytokens: [], honeytoken_hit_count: 0, ml_layer_enabled: true };
+let honeytokenHitLog = [];
+const clientId = "tab_" + Math.random().toString(36).slice(2);
+
+function addAskBubble(text, cls) {
+  const box = document.getElementById("ask-messages");
+  const b = document.createElement("div");
+  b.className = "ask-bubble " + cls;
+  b.textContent = text;
+  box.appendChild(b);
+  box.scrollTop = box.scrollHeight;
+  return b;
+}
+
+async function askCerberus() {
+  const input = document.getElementById("ask-input");
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = "";
+  addAskBubble(question, "user");
+  const loadingBubble = addAskBubble("thinking…", "agent loading");
+  try {
+    const res = await fetch(`${API}/analyze`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, client_id: clientId }),
+    });
+    const data = await res.json();
+    loadingBubble.textContent = data.answer;
+    loadingBubble.classList.remove("loading");
+  } catch (err) {
+    loadingBubble.textContent = "Couldn't reach Cerberus backend: " + err;
+    loadingBubble.classList.remove("loading");
+  }
+}
+
+// fixed node positions (simple hand-laid graph layout)
+const positions = {
+  OrderService:     { x: 150, y: 200 },
+  PaymentService:   { x: 400, y: 100 },
+  InventoryService: { x: 400, y: 300 },
+  BankGateway:      { x: 650, y: 100 },
+  UserDBService:    { x: 650, y: 300 },
+};
+
+function connectWS() {
+  const ws = new WebSocket("ws://localhost:8000/ws");
+  ws.onmessage = (evt) => {
+    const data = JSON.parse(evt.data);
+    if (data.type === "state") {
+      state.services = data.services;
+      state.edges = data.edges;
+      state.log = data.log;
+      state.honeytokens = data.honeytokens || [];
+      state.honeytoken_hit_count = data.honeytoken_hit_count || 0;
+      state.ml_layer_enabled = data.ml_layer_enabled;
+      render();
+    }
+  };
+  ws.onclose = () => setTimeout(connectWS, 1500);
+}
+
+function trustColor(score, compromised) {
+  if (compromised) return "var(--red)";
+  if (score > 60) return "var(--green)";
+  if (score > 30) return "var(--amber)";
+  return "var(--red)";
+}
+
+function render() {
+  renderGraph();
+  renderTrustBars();
+  renderLog();
+  renderHoneytokens();
+  populateAttackDropdown();
+  updateHealthScore();
+  syncCompareModeToggle();
+}
+
+function syncCompareModeToggle() {
+  if (typeof state.ml_layer_enabled === "boolean") {
+    document.getElementById("compare-mode-toggle").checked = state.ml_layer_enabled;
+    document.getElementById("compare-mode-state").textContent = state.ml_layer_enabled ? "ON" : "OFF";
+  }
+}
+
+async function updateHealthScore() {
+  const services = Object.values(state.services || {});
+  const avgTrust = services.length
+    ? services.reduce((sum, s) => sum + s.score, 0) / services.length
+    : 100;
+
+  // pull totals from the summary endpoint (event_counts covers the full log,
+  // not just the last-30 slice kept in the live state payload)
+  let blocked = 0, attacks = 0, honeytoken = state.honeytoken_hit_count || 0;
+  try {
+    const res = await fetch(`${API}/summary`);
+    const d = await res.json();
+    blocked = d.event_counts?.block || 0;
+    attacks = d.event_counts?.attack || 0;
+  } catch (e) { /* summary endpoint optional for this widget */ }
+
+  // composite score: mostly average trust, with a bonus for demonstrated defense
+  const defenseBonus = Math.min(20, (blocked + attacks) * 1.5);
+  const score = Math.round(Math.min(100, avgTrust * 0.8 + defenseBonus));
+
+  document.getElementById("health-score-text").textContent = score;
+  document.getElementById("health-avg-trust").textContent = avgTrust.toFixed(0) + "/100";
+  document.getElementById("health-attacks").textContent = attacks;
+  document.getElementById("health-blocked").textContent = blocked;
+  document.getElementById("health-honeytoken").textContent = honeytoken;
+
+  const ring = document.getElementById("health-ring-fill");
+  const circumference = 188.5;
+  ring.setAttribute("stroke-dashoffset", circumference - (score / 100) * circumference);
+  ring.setAttribute("stroke", score > 60 ? "var(--green)" : score > 30 ? "var(--amber)" : "var(--red)");
+}
+
+async function toggleCompareMode() {
+  const enabled = document.getElementById("compare-mode-toggle").checked;
+  document.getElementById("compare-mode-state").textContent = enabled ? "ON" : "OFF";
+  await fetch(`${API}/toggle/ml_layer?enabled=${enabled}`, { method: "POST" });
+}
+
+async function exportReport() {
+  const res = await fetch(`${API}/export/report`);
+  const data = await res.json();
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `cerberus_incident_report_${Date.now()}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+function renderHoneytokens() {
+  const decoyList = document.getElementById("decoy-list");
+  decoyList.innerHTML = (state.honeytokens || []).map(name =>
+    `<span class="decoy-chip">${name}</span>`
+  ).join("");
+
+  document.getElementById("honeytoken-count").textContent = `${state.honeytoken_hit_count} hit${state.honeytoken_hit_count === 1 ? '' : 's'}`;
+
+  // pull honeytoken-flagged entries out of the main log for a focused view
+  const hits = (state.log || []).filter(l => l.message && l.message.includes("HONEYTOKEN"));
+  const el = document.getElementById("honeytoken-hits");
+  el.innerHTML = hits.slice(-5).reverse().map(h => `
+    <div class="honeytoken-hit">
+      <b>${h.caller || 'unknown'}</b> touched decoy <b>${h.callee || ''}</b>
+      <div style="color:var(--muted); margin-top:2px;">${new Date(h.ts*1000).toLocaleTimeString()} — confirmed malicious</div>
+    </div>`).join("");
+}
+
+function renderGraph() {
+  const svg = document.getElementById("graph");
+  let html = "";
+
+  // edges
+  state.edges.forEach(e => {
+    const a = positions[e.from], b = positions[e.to];
+    if (!a || !b) return;
+    html += `<line class="edge-line" x1="${a.x}" y1="${a.y}" x2="${b.x}" y2="${b.y}" stroke-dasharray="${e.weight < 0.5 ? '4,3' : ''}" />`;
+  });
+
+  // nodes
+  Object.entries(state.services).forEach(([name, s]) => {
+    const p = positions[name];
+    if (!p) return;
+    const color = trustColor(s.score, s.compromised);
+    const radius = 34;
+    html += `
+      <circle class="node-circle" cx="${p.x}" cy="${p.y}" r="${radius}"
+        fill="${s.compromised ? 'rgba(255,77,94,0.15)' : '#241640'}"
+        stroke="${color}" />
+      <text class="node-label" x="${p.x}" y="${p.y - 2}">${name.replace('Service','')}</text>
+      <text class="node-score" x="${p.x}" y="${p.y + 14}">${s.score.toFixed(0)}%</text>
+      ${s.compromised ? `<text x="${p.x}" y="${p.y - 46}" text-anchor="middle" font-size="16">⚠</text>` : ''}
+    `;
+  });
+
+  svg.innerHTML = html;
+}
+
+function renderTrustBars() {
+  const el = document.getElementById("trust-bars");
+  el.innerHTML = Object.entries(state.services).map(([name, s]) => {
+    const color = trustColor(s.score, s.compromised);
+    const rl = s.rate_limit || { count: 0, limit: 20 };
+    const rlPct = Math.min(100, (rl.count / rl.limit) * 100);
+    const rlClass = rl.count >= rl.limit ? "rl-full" : (rl.count / rl.limit > 0.7 ? "rl-tight" : "");
+    const fp = s.fingerprint || { sample_count: 0, baseline_ready: false, avg_payload: null };
+    const fpLabel = fp.baseline_ready
+      ? `<span class="fp-badge">fingerprint: avg ${Math.round(fp.avg_payload)}B (${fp.sample_count}/30)</span>`
+      : `<span class="fp-badge fp-warming">fingerprint warming ${fp.sample_count}/30</span>`;
+    const quarantineBadge = s.quarantined
+      ? `<span class="quarantine-badge">🔒 quarantined — ${s.quarantine_remaining}s left</span>`
+      : "";
+
+    return `
+      <div class="svc-card ${s.quarantined ? 'quarantined' : ''}">
+        <div class="svc-card-header">
+          <span>${name}</span>
+          ${quarantineBadge}
+        </div>
+        <div class="trust-row" style="margin-bottom:4px; margin-top:6px;">
+          <div class="trust-bar-bg"><div class="trust-bar-fill" style="width:${s.score}%; background:${color};"></div></div>
+          <div style="width:36px; text-align:right;">${s.score.toFixed(0)}</div>
+        </div>
+        <div class="svc-sub">
+          <span>rate limit: ${rl.count}/${rl.limit} per ${rl.window_seconds || 10}s</span>
+          <span>${fpLabel}</span>
+        </div>
+        <div class="rl-bar-bg"><div class="rl-bar-fill ${rlClass}" style="width:${rlPct}%;"></div></div>
+      </div>`;
+  }).join("");
+}
+
+function renderLog() {
+  const el = document.getElementById("log-list");
+  el.innerHTML = [...state.log].reverse().map(l => {
+    return `<div class="log-entry log-${l.kind}">[${new Date(l.ts*1000).toLocaleTimeString()}] ${l.message}${l.reason ? ' — ' + l.reason : ''}</div>`;
+  }).join("");
+}
+
+function populateAttackDropdown() {
+  const sel = document.getElementById("attack-target");
+  if (sel.options.length) return;
+  Object.keys(state.services).forEach(name => {
+    const opt = document.createElement("option");
+    opt.value = name; opt.textContent = name;
+    sel.appendChild(opt);
+  });
+}
+
+async function simulateAttack() {
+  const target = document.getElementById("attack-target").value;
+  const res = await fetch(`${API}/simulate/attack`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ compromised_service: target })
+  });
+  const data = await res.json();
+  const blastPanel = document.getElementById("blast-panel");
+  const blastList = document.getElementById("blast-list");
+  const blastListMl = document.getElementById("blast-list-ml");
+  if (data.blast_radius && data.blast_radius.length) {
+    blastPanel.classList.add("show");
+    blastList.innerHTML = data.blast_radius.map(r => `
+      <div class="radius-item">
+        <b>${r.service}</b> — ${r.predicted_risk}%
+        (${r.hops_away} hop${r.hops_away>1?'s':''} via ${r.via})
+      </div>`).join("");
+  }
+  if (data.ml_blast_radius && data.ml_blast_radius.length) {
+    blastPanel.classList.add("show");
+    blastListMl.innerHTML = data.ml_blast_radius.map(r => `
+      <div class="radius-item">
+        <b>${r.service}</b> — ${r.predicted_risk}%
+        (${r.hops_away} hop${r.hops_away>1?'s':''} via ${r.via})
+      </div>`).join("");
+  } else if (blastListMl) {
+    blastListMl.innerHTML = `<div class="radius-item" style="color:var(--muted)">model still warming up</div>`;
+  }
+  refreshSummary();
+}
+
+async function fireSyntheticAttack() {
+  const btn = event.target;
+  btn.disabled = true;
+  btn.textContent = "Firing burst…";
+  try {
+    const res = await fetch(`${API}/simulate/synthetic_attack?size=6`, { method: "POST" });
+    const data = await res.json();
+    const el = document.getElementById("synth-result");
+    el.innerHTML = `
+      <div class="synth-summary">
+        <span class="synth-badge blocked">${data.blocked} blocked</span>
+        <span class="synth-badge allowed">${data.allowed} allowed</span>
+      </div>
+      ${data.requests.map(r => `
+        <div class="synth-item">
+          <b>${r.pattern}</b>: ${r.caller} → ${r.callee}
+          — <span class="decision-${r.decision}">${r.decision.toUpperCase()}</span>
+        </div>`).join("")}
+    `;
+    refreshSummary();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = "🔥 Fire Attack Burst (6 requests)";
+  }
+}
+
+async function explainSelectedService() {
+  const target = document.getElementById("attack-target").value;
+  const res = await fetch(`${API}/explain/${target}`);
+  const data = await res.json();
+  const el = document.getElementById("explain-result");
+  if (data.error) {
+    el.innerHTML = `<div style="color:var(--muted); font-size:12px;">${data.error}</div>`;
+    return;
+  }
+  const bars = (data.breakdown || []).filter(b => b.contribution_pct !== null);
+  if (!bars.length) {
+    el.innerHTML = `<div style="color:var(--muted); font-size:12px;">No risk factors currently contributing for ${target}.</div>`;
+    return;
+  }
+  el.innerHTML = `
+    <div style="font-size:11px; color:var(--muted); margin-bottom:6px;">
+      method: ${data.method}
+    </div>
+    ${bars.map(b => `
+      <div class="explain-bar-row">
+        <div class="explain-bar-label"><span>${b.factor.replace(/_/g,' ')}</span><span>${b.contribution_pct}%</span></div>
+        <div class="explain-bar-bg"><div class="explain-bar-fill" style="width:${b.contribution_pct}%;"></div></div>
+      </div>`).join("")}
+  `;
+}
+
+async function refreshSummary() {
+  const res = await fetch(`${API}/summary`);
+  const data = await res.json();
+  document.getElementById("summary-box").textContent = data.summary;
+  const counts = data.event_counts || {};
+  document.getElementById("summary-counts").innerHTML = Object.entries(counts).map(([k,v]) =>
+    `<span class="count-chip">${k}: ${v}</span>`
+  ).join("") + `<span class="count-chip">honeytoken hits: ${data.honeytoken_hits}</span>`;
+}
+
+async function simulateHoneytokenProbe() {
+  const target = document.getElementById("attack-target").value;
+  const res = await fetch(`${API}/simulate/honeytoken_probe`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ compromised_service: target })
+  });
+  const data = await res.json();
+  // brief visual flash so it's obvious something happened even before log updates
+  const panel = document.getElementById("honeytoken-panel");
+  panel.style.boxShadow = "0 0 0 2px var(--red)";
+  setTimeout(() => panel.style.boxShadow = "none", 800);
+}
+
+async function sendNormalTraffic() {
+  await fetch(`${API}/proxy/request`, {
+    method: "POST", headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({ caller: "OrderService", callee: "PaymentService", payload_size: 300, hour: 14 })
+  });
+}
+
+async function resetSystem() {
+  await fetch(`${API}/reset`, { method: "POST" });
+  document.getElementById("blast-panel").classList.remove("show");
+  document.getElementById("synth-result").innerHTML = "";
+  document.getElementById("explain-result").innerHTML = "";
+  refreshSummary();
+}
+
+connectWS();
+fetch(`${API}/state`).then(r => r.json()).then(d => { state.services=d.services; state.edges=d.edges; state.log=d.log; render(); });
+refreshSummary();
+</script>
+
+</body>
+</html>
