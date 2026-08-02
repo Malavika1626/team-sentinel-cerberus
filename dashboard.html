@@ -1,4 +1,3 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -208,6 +207,17 @@
 
   /* Export button */
   button.export-btn { background: transparent; border-color: var(--blue); color: var(--blue); }
+
+  /* New agent panels: Threat Hunter / Advisor / Policy / Forensics */
+  .agent-not-configured {
+    display: none; color: var(--muted); font-size: 12px; margin: 8px 0; line-height: 1.5;
+  }
+  .agent-result-box {
+    font-size: 12px; line-height: 1.5; color: var(--text); margin-top: 10px;
+    white-space: pre-wrap;
+  }
+  .agent-result-box.empty { color: var(--muted); font-style: italic; }
+  #forensics-messages { margin-top: 10px; max-height: 220px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; }
 </style>
 </head>
 <body>
@@ -348,6 +358,51 @@
     <div id="summary-counts"></div>
   </div>
 
+  <div class="panel" id="hunter-panel">
+    <b>🕵 Threat Hunter <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="hunter-not-configured" class="agent-not-configured">
+      Threat Hunter isn't configured for this run — set <code>LYZR_HUNTER_AGENT_ID</code>
+      on the backend to enable proactive scans.
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+      Proactive scan of the live state — flags anything worth a SOC analyst's attention, no question needed.
+    </div>
+    <div class="controls" style="margin-top:8px;">
+      <button id="hunter-button" onclick="runThreatHunt()">🕵 Run Threat Hunt</button>
+    </div>
+    <div id="hunter-result" class="agent-result-box empty">Click "Run Threat Hunt" for a live scan.</div>
+  </div>
+
+  <div class="panel" id="advisor-panel">
+    <b>📋 Remediation Advisor <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="advisor-not-configured" class="agent-not-configured">
+      Remediation Advisor isn't configured for this run — set <code>LYZR_ADVISOR_AGENT_ID</code>
+      on the backend to enable AI-written playbooks.
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+      Actionable playbook for the service selected in Controls (uses the same dropdown as Simulate Attack).
+    </div>
+    <div class="controls" style="margin-top:8px;">
+      <button id="advisor-button" onclick="getAdvice()">📋 Get Playbook for Selected Service</button>
+    </div>
+    <div id="advisor-result" class="agent-result-box empty">Pick a service above, then click to get a remediation playbook.</div>
+  </div>
+
+  <div class="panel" id="policy-panel">
+    <b>⚙ Policy Tuning Agent <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="policy-not-configured" class="agent-not-configured">
+      Policy Tuning Agent isn't configured for this run — set <code>LYZR_POLICY_AGENT_ID</code>
+      on the backend to enable AI-driven threshold tuning suggestions.
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+      Advisory only — reads current thresholds + recent traffic and suggests tuning; never changes config itself.
+    </div>
+    <div class="controls" style="margin-top:8px;">
+      <button id="policy-button" onclick="reviewPolicy()">⚙ Review Policy</button>
+    </div>
+    <div id="policy-result" class="agent-result-box empty">Click "Review Policy" for tuning suggestions.</div>
+  </div>
+
   <div class="panel" id="ask-panel">
     <b>🤖 Ask Cerberus <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
     <div id="ask-not-configured" style="display:none; color:var(--muted); font-size:12px; margin:8px 0; line-height:1.5;">
@@ -364,10 +419,28 @@
       <button id="ask-button" onclick="askCerberus()">Ask</button>
     </div>
   </div>
+
+  <div class="panel" id="forensics-panel">
+    <b>🔬 Chronos Forensics <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="forensics-not-configured" class="agent-not-configured">
+      Chronos Forensics isn't configured for this run — set <code>LYZR_FORENSICS_AGENT_ID</code>
+      on the backend to enable root-cause Q&A over the incident replay timeline.
+    </div>
+    <div style="font-size:11px; color:var(--muted); margin-top:6px;">
+      Root-cause Q&A over the <i>historical</i> replay timeline (distinct from Ask Cerberus, which only sees live state).
+    </div>
+    <div id="forensics-messages"></div>
+    <div style="display:flex; gap:6px; margin-top:8px;">
+      <input id="forensics-input" type="text" placeholder="What actually triggered the OrderService quarantine earlier?"
+             style="flex:1; background:#0d0818; border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px; font-size:12px;"
+             onkeydown="if(event.key==='Enter') askForensics();">
+      <button id="forensics-button" onclick="askForensics()">Ask</button>
+    </div>
+  </div>
 </div>
 
 <script>
-const API = window.location.origin;
+const API = "http://localhost:8000";
 let state = { services: {}, edges: [], log: [], honeytokens: [], honeytoken_hit_count: 0, ml_layer_enabled: true };
 let honeytokenHitLog = [];
 const clientId = "tab_" + Math.random().toString(36).slice(2);
@@ -414,8 +487,7 @@ const positions = {
 };
 
 function connectWS() {
-  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-  const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
+  const ws = new WebSocket("ws://localhost:8000/ws");
   ws.onmessage = (evt) => {
     const data = JSON.parse(evt.data);
     if (data.type === "state") {
@@ -427,9 +499,17 @@ function connectWS() {
       state.ml_layer_enabled = data.ml_layer_enabled;
       state.lyzr_configured = data.lyzr_configured;
       state.lyzr_narrator_configured = data.lyzr_narrator_configured;
+      state.lyzr_hunter_configured = data.lyzr_hunter_configured;
+      state.lyzr_advisor_configured = data.lyzr_advisor_configured;
+      state.lyzr_policy_configured = data.lyzr_policy_configured;
+      state.lyzr_forensics_configured = data.lyzr_forensics_configured;
       render();
       syncAskCerberusAvailability();
       syncNarratorStatus();
+      syncAgentAvailability("hunter", state.lyzr_hunter_configured);
+      syncAgentAvailability("advisor", state.lyzr_advisor_configured);
+      syncAgentAvailability("policy", state.lyzr_policy_configured);
+      syncAgentAvailability("forensics", state.lyzr_forensics_configured, true);
     }
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
@@ -452,6 +532,119 @@ function syncAskCerberusAvailability() {
     input.placeholder = "Ask-Cerberus not configured for this run";
     button.style.opacity = "0.5";
     button.style.cursor = "not-allowed";
+  }
+}
+
+// Generic version of syncAskCerberusAvailability() for the 4 newer agents —
+// disables the panel's input(s) once (state pushes arrive repeatedly, no
+// need to re-toggle) if the backend reports that agent isn't configured.
+const _agentAvailabilitySynced = {};
+function syncAgentAvailability(prefix, configured, isChat) {
+  if (_agentAvailabilitySynced[prefix] || typeof configured !== "boolean") return;
+  _agentAvailabilitySynced[prefix] = true;
+  if (configured) return;
+  const notConfigured = document.getElementById(`${prefix}-not-configured`);
+  if (notConfigured) notConfigured.style.display = "block";
+  const button = document.getElementById(`${prefix}-button`);
+  if (button) {
+    button.disabled = true;
+    button.style.opacity = "0.5";
+    button.style.cursor = "not-allowed";
+  }
+  if (isChat) {
+    const input = document.getElementById(`${prefix}-input`);
+    if (input) {
+      input.disabled = true;
+      input.placeholder = "Chronos Forensics not configured for this run";
+    }
+  }
+}
+
+async function runThreatHunt() {
+  const btn = document.getElementById("hunter-button");
+  const box = document.getElementById("hunter-result");
+  btn.disabled = true;
+  box.classList.add("empty");
+  box.textContent = "Scanning live state…";
+  try {
+    const res = await fetch(`${API}/threat_hunt`);
+    const data = await res.json();
+    box.classList.remove("empty");
+    box.textContent = data.finding;
+  } catch (err) {
+    box.textContent = "Couldn't reach Cerberus backend: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function getAdvice() {
+  const service = document.getElementById("attack-target").value;
+  const btn = document.getElementById("advisor-button");
+  const box = document.getElementById("advisor-result");
+  if (!service) { box.textContent = "Pick a service in the Controls panel first."; return; }
+  btn.disabled = true;
+  box.classList.add("empty");
+  box.textContent = `Building playbook for ${service}…`;
+  try {
+    const res = await fetch(`${API}/advise/${service}`, { method: "POST" });
+    const data = await res.json();
+    box.classList.remove("empty");
+    box.textContent = data.error === "unknown service" ? data.error : data.advice;
+  } catch (err) {
+    box.textContent = "Couldn't reach Cerberus backend: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function reviewPolicy() {
+  const btn = document.getElementById("policy-button");
+  const box = document.getElementById("policy-result");
+  btn.disabled = true;
+  box.classList.add("empty");
+  box.textContent = "Reviewing thresholds…";
+  try {
+    const res = await fetch(`${API}/policy_review`);
+    const data = await res.json();
+    box.classList.remove("empty");
+    box.textContent = data.suggestion;
+  } catch (err) {
+    box.textContent = "Couldn't reach Cerberus backend: " + err;
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+function addForensicsBubble(text, cls) {
+  const box = document.getElementById("forensics-messages");
+  const b = document.createElement("div");
+  b.className = "ask-bubble " + cls;
+  b.textContent = text;
+  box.appendChild(b);
+  box.scrollTop = box.scrollHeight;
+  return b;
+}
+
+async function askForensics() {
+  const input = document.getElementById("forensics-input");
+  const question = input.value.trim();
+  if (!question) return;
+  input.value = "";
+  addForensicsBubble(question, "user");
+  const loadingBubble = addForensicsBubble("thinking…", "agent loading");
+  try {
+    const res = await fetch(`${API}/forensics`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ question, client_id: clientId }),
+    });
+    const data = await res.json();
+    loadingBubble.textContent = data.answer;
+    loadingBubble.classList.remove("loading");
+  } catch (err) {
+    loadingBubble.textContent = "Couldn't reach Cerberus backend: " + err;
+    loadingBubble.classList.remove("loading");
   }
 }
 
