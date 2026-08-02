@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -440,7 +441,7 @@
 </div>
 
 <script>
-const API = "http://localhost:8000";
+const API = "https://team-sentinel-cerberus.onrender.com";
 let state = { services: {}, edges: [], log: [], honeytokens: [], honeytoken_hit_count: 0, ml_layer_enabled: true };
 let honeytokenHitLog = [];
 const clientId = "tab_" + Math.random().toString(36).slice(2);
@@ -487,7 +488,7 @@ const positions = {
 };
 
 function connectWS() {
-  const ws = new WebSocket("ws://localhost:8000/ws");
+  const ws = new WebSocket("wss://team-sentinel-cerberus.onrender.com/ws");
   ws.onmessage = (evt) => {
     const data = JSON.parse(evt.data);
     if (data.type === "state") {
