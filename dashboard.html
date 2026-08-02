@@ -1,3 +1,4 @@
+
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -170,6 +171,24 @@
   #summary-counts { display:flex; gap:8px; margin-top:8px; flex-wrap:wrap; }
   .count-chip { font-size:10px; padding:2px 7px; border-radius:8px; background:#241640; color:var(--muted); }
 
+  /* MITRE ATT&CK badge */
+  .mitre-tag {
+    display:inline-block; font-size:10px; padding:1px 6px; border-radius:8px;
+    background: rgba(255,180,84,0.15); color: var(--amber); margin-left:6px; font-weight:600;
+    font-family: 'Consolas', monospace;
+  }
+
+  /* Incident Replay */
+  #replay-panel { border-color: #4a2f7a; }
+  #replay-slider { width:100%; margin-top:10px; accent-color: var(--blue); }
+  #replay-timestamp { font-size:11px; color:var(--muted); display:flex; justify-content:space-between; margin-top:4px; }
+  .replay-label { font-size:11px; color: var(--amber); font-weight:600; margin:8px 0; min-height:14px; }
+  .replay-row { display:flex; align-items:center; gap:8px; font-size:12px; margin-bottom:5px; }
+  .replay-row .replay-name { width:110px; flex-shrink:0; }
+  .replay-bar-bg { flex:1; background:#241640; border-radius:4px; height:8px; overflow:hidden; }
+  .replay-bar-fill { height:100%; border-radius:4px; transition: width 0.15s ease, background 0.15s ease; }
+  .replay-badges { width:70px; flex-shrink:0; text-align:right; font-size:10px; }
+
   /* Health score card */
   #health-panel { display:flex; align-items:center; gap:16px; }
   #health-score-ring { flex-shrink:0; }
@@ -221,6 +240,7 @@
   <div class="panel" id="blast-panel">
     <b style="color:var(--red)">⚠ Predicted Blast Radius</b>
     <span class="ml-tag">rule-based vs learned (RandomForest)</span>
+    <span class="mitre-tag" id="blast-mitre-tag" style="display:none;"></span>
     <div class="radius-compare">
       <div class="radius-col">
         <div class="radius-col-title">Rule-based (formula)</div>
@@ -231,6 +251,18 @@
         <div id="blast-list-ml"></div>
       </div>
     </div>
+  </div>
+
+  <div class="panel" id="replay-panel">
+    <b>⏮ Incident Replay</b>
+    <span class="ml-tag">scrub back through trust history</span>
+    <div class="controls" style="margin-top:8px;">
+      <button onclick="loadReplayHistory()">↻ Load Timeline</button>
+    </div>
+    <input type="range" id="replay-slider" min="0" max="0" value="0" oninput="renderReplayFrame(this.value)" disabled>
+    <div id="replay-timestamp"><span id="replay-time-label">no timeline loaded</span><span id="replay-position-label"></span></div>
+    <div class="replay-label" id="replay-event-label"></div>
+    <div id="replay-readout"></div>
   </div>
 </div>
 
@@ -246,6 +278,9 @@
       <button class="honeytoken-btn" onclick="simulateHoneytokenProbe()">Probe Honeytoken 🍯</button>
       <button class="reset" onclick="resetSystem()">Reset</button>
     </div>
+    <div class="controls" style="margin-top:8px;">
+      <button onclick="seedDemo()" id="seed-demo-btn">🌱 Seed Demo Traffic</button>
+    </div>
     <div class="toggle-row">
       <div>
         <b style="font-size:13px;">🧪 Compare Mode</b>
@@ -258,6 +293,10 @@
     </div>
     <div class="controls" style="margin-top:10px;">
       <button class="export-btn" onclick="exportReport()">⬇ Export Incident Report (JSON)</button>
+      <button class="export-btn" onclick="exportReportPdf()">⬇ Export Incident Report (PDF)</button>
+    </div>
+    <div id="narrator-status" style="color:var(--muted); font-size:11px; margin-top:6px;">
+      Executive summary: <span id="narrator-status-text">rule-based digest</span>
     </div>
   </div>
 
@@ -311,18 +350,24 @@
 
   <div class="panel" id="ask-panel">
     <b>🤖 Ask Cerberus <span style="color:var(--muted); font-weight:400; font-size:11px;">(Lyzr agent)</span></b>
+    <div id="ask-not-configured" style="display:none; color:var(--muted); font-size:12px; margin:8px 0; line-height:1.5;">
+      Ask-Cerberus isn't configured for this run — set <code>LYZR_API_KEY</code> and
+      <code>LYZR_AGENT_ID</code> on the backend to enable it. Everything else on this
+      dashboard (trust scores, blast radius, quarantine, explainability) runs fully
+      without it.
+    </div>
     <div id="ask-messages"></div>
     <div style="display:flex; gap:6px; margin-top:8px;">
       <input id="ask-input" type="text" placeholder="Why was OrderService quarantined?"
              style="flex:1; background:#0d0818; border:1px solid var(--border); border-radius:6px; color:var(--text); padding:8px; font-size:12px;"
              onkeydown="if(event.key==='Enter') askCerberus();">
-      <button onclick="askCerberus()">Ask</button>
+      <button id="ask-button" onclick="askCerberus()">Ask</button>
     </div>
   </div>
 </div>
 
 <script>
-const API = "http://localhost:8000";
+const API = window.location.origin;
 let state = { services: {}, edges: [], log: [], honeytokens: [], honeytoken_hit_count: 0, ml_layer_enabled: true };
 let honeytokenHitLog = [];
 const clientId = "tab_" + Math.random().toString(36).slice(2);
@@ -369,7 +414,8 @@ const positions = {
 };
 
 function connectWS() {
-  const ws = new WebSocket("ws://localhost:8000/ws");
+  const wsProtocol = window.location.protocol === "https:" ? "wss:" : "ws:";
+  const ws = new WebSocket(`${wsProtocol}//${window.location.host}/ws`);
   ws.onmessage = (evt) => {
     const data = JSON.parse(evt.data);
     if (data.type === "state") {
@@ -379,10 +425,43 @@ function connectWS() {
       state.honeytokens = data.honeytokens || [];
       state.honeytoken_hit_count = data.honeytoken_hit_count || 0;
       state.ml_layer_enabled = data.ml_layer_enabled;
+      state.lyzr_configured = data.lyzr_configured;
+      state.lyzr_narrator_configured = data.lyzr_narrator_configured;
       render();
+      syncAskCerberusAvailability();
+      syncNarratorStatus();
     }
   };
   ws.onclose = () => setTimeout(connectWS, 1500);
+}
+
+// Only touch the Ask-Cerberus panel's disabled state once we know the answer,
+// and only once (state pushes arrive every couple seconds via the decay loop —
+// no need to re-toggle the same UI repeatedly).
+let _askAvailabilitySynced = false;
+function syncAskCerberusAvailability() {
+  if (_askAvailabilitySynced || typeof state.lyzr_configured !== "boolean") return;
+  _askAvailabilitySynced = true;
+  const notConfigured = document.getElementById("ask-not-configured");
+  const input = document.getElementById("ask-input");
+  const button = document.getElementById("ask-button");
+  if (!state.lyzr_configured) {
+    notConfigured.style.display = "block";
+    input.disabled = true;
+    button.disabled = true;
+    input.placeholder = "Ask-Cerberus not configured for this run";
+    button.style.opacity = "0.5";
+    button.style.cursor = "not-allowed";
+  }
+}
+
+function syncNarratorStatus() {
+  const el = document.getElementById("narrator-status-text");
+  if (!el || typeof state.lyzr_narrator_configured !== "boolean") return;
+  el.textContent = state.lyzr_narrator_configured
+    ? "🤖 AI-written by Cerberus Narrator (Lyzr agent)"
+    : "rule-based digest (set LYZR_NARRATOR_AGENT_ID to enable AI narrative)";
+  el.style.color = state.lyzr_narrator_configured ? "var(--green)" : "var(--muted)";
 }
 
 function trustColor(score, compromised) {
@@ -457,6 +536,75 @@ async function exportReport() {
   a.download = `cerberus_incident_report_${Date.now()}.json`;
   a.click();
   URL.revokeObjectURL(url);
+}
+
+async function exportReportPdf() {
+  const res = await fetch(`${API}/export/report_pdf`);
+  const blob = await res.blob();
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = `cerberus_incident_report_${Date.now()}.pdf`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
+async function seedDemo() {
+  const btn = document.getElementById("seed-demo-btn");
+  btn.disabled = true;
+  btn.textContent = "Seeding…";
+  try {
+    const res = await fetch(`${API}/seed_demo`, { method: "POST" });
+    const data = await res.json();
+    btn.textContent = `🌱 Seeded ${data.requests_fired} requests`;
+    setTimeout(() => { btn.textContent = "🌱 Seed Demo Traffic"; }, 2000);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// --- Incident Replay ---------------------------------------------------
+let replayHistory = [];
+
+async function loadReplayHistory() {
+  const res = await fetch(`${API}/history?limit=300`);
+  const data = await res.json();
+  replayHistory = data.history || [];
+  const slider = document.getElementById("replay-slider");
+  slider.max = Math.max(0, replayHistory.length - 1);
+  slider.value = slider.max;
+  slider.disabled = replayHistory.length === 0;
+  if (!replayHistory.length) {
+    document.getElementById("replay-time-label").textContent = "no history yet — run some traffic first";
+    return;
+  }
+  renderReplayFrame(slider.value);
+}
+
+function renderReplayFrame(index) {
+  if (!replayHistory.length) return;
+  const frame = replayHistory[Math.min(index, replayHistory.length - 1)];
+  if (!frame) return;
+
+  const startT = replayHistory[0].t;
+  document.getElementById("replay-time-label").textContent = `T+${(frame.t - startT).toFixed(1)}s`;
+  document.getElementById("replay-position-label").textContent = `frame ${Number(index) + 1}/${replayHistory.length}`;
+  document.getElementById("replay-event-label").textContent = frame.label ? `● ${frame.label}` : "";
+
+  const el = document.getElementById("replay-readout");
+  el.innerHTML = Object.entries(frame.services).map(([name, s]) => {
+    const color = trustColor(s.score, s.compromised);
+    const badges = [
+      s.compromised ? "⚠" : "",
+      s.quarantined ? "🔒" : "",
+    ].filter(Boolean).join(" ");
+    return `
+      <div class="replay-row">
+        <span class="replay-name">${name}</span>
+        <div class="replay-bar-bg"><div class="replay-bar-fill" style="width:${s.score}%; background:${color};"></div></div>
+        <span class="replay-badges">${s.score.toFixed(0)} ${badges}</span>
+      </div>`;
+  }).join("");
 }
 
 function renderHoneytokens() {
@@ -568,6 +716,13 @@ async function simulateAttack() {
   const blastPanel = document.getElementById("blast-panel");
   const blastList = document.getElementById("blast-list");
   const blastListMl = document.getElementById("blast-list-ml");
+  const mitreTag = document.getElementById("blast-mitre-tag");
+  if (data.mitre) {
+    mitreTag.textContent = `${data.mitre.id} ${data.mitre.name} (${data.mitre.tactic})`;
+    mitreTag.style.display = "inline-block";
+  } else {
+    mitreTag.style.display = "none";
+  }
   if (data.blast_radius && data.blast_radius.length) {
     blastPanel.classList.add("show");
     blastList.innerHTML = data.blast_radius.map(r => `
@@ -606,6 +761,7 @@ async function fireSyntheticAttack() {
         <div class="synth-item">
           <b>${r.pattern}</b>: ${r.caller} → ${r.callee}
           — <span class="decision-${r.decision}">${r.decision.toUpperCase()}</span>
+          ${r.mitre ? `<span class="mitre-tag">${r.mitre.id} ${r.mitre.name}</span>` : ''}
         </div>`).join("")}
     `;
     refreshSummary();
@@ -676,6 +832,14 @@ async function resetSystem() {
   document.getElementById("blast-panel").classList.remove("show");
   document.getElementById("synth-result").innerHTML = "";
   document.getElementById("explain-result").innerHTML = "";
+  document.getElementById("blast-mitre-tag").style.display = "none";
+  replayHistory = [];
+  const slider = document.getElementById("replay-slider");
+  slider.max = 0; slider.value = 0; slider.disabled = true;
+  document.getElementById("replay-time-label").textContent = "no timeline loaded";
+  document.getElementById("replay-position-label").textContent = "";
+  document.getElementById("replay-event-label").textContent = "";
+  document.getElementById("replay-readout").innerHTML = "";
   refreshSummary();
 }
 
