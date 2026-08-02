@@ -24,9 +24,10 @@ from datetime import datetime
 from typing import Dict, List, Optional
 
 import requests
+from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response, FileResponse
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from ml_layer import (
@@ -46,15 +47,57 @@ from ml_layer import (
 # Both are optional/env-driven; each degrades independently and doesn't
 # block the other or the core rule-based engine.
 # ---------------------------------------------------------------------------
+load_dotenv()  # picks up a local .env file if present, no-op otherwise
+
 LYZR_API_KEY = os.environ.get("LYZR_API_KEY", "")
 LYZR_AGENT_ID = os.environ.get("LYZR_AGENT_ID", "")
 LYZR_NARRATOR_AGENT_ID = os.environ.get("LYZR_NARRATOR_AGENT_ID", "")
+# ---------------------------------------------------------------------------
+# 4 more independent Lyzr agents, each optional / each degrades on its own:
+#   3. LYZR_HUNTER_AGENT_ID    -> "Threat Hunter"        proactive scan (no question needed)
+#   4. LYZR_ADVISOR_AGENT_ID   -> "Remediation Advisor"   one-shot playbook for one service
+#   5. LYZR_POLICY_AGENT_ID    -> "Policy Tuning Agent"   one-shot threshold-tuning advisory
+#   6. LYZR_FORENSICS_AGENT_ID -> "Forensics Q&A"         chat over the *historical* replay
+#                                  timeline (distinct from Ask-Cerberus, which only sees live state)
+# ---------------------------------------------------------------------------
+LYZR_HUNTER_AGENT_ID = os.environ.get("LYZR_HUNTER_AGENT_ID", "")
+LYZR_ADVISOR_AGENT_ID = os.environ.get("LYZR_ADVISOR_AGENT_ID", "")
+LYZR_POLICY_AGENT_ID = os.environ.get("LYZR_POLICY_AGENT_ID", "")
+LYZR_FORENSICS_AGENT_ID = os.environ.get("LYZR_FORENSICS_AGENT_ID", "")
 # Lyzr Studio ties usage/rate-limits to a user_id tied to your account —
 # use the same email you signed up with (shown in Lyzr's own example curl
 # on the Deploy tab), not an arbitrary string, or calls get 403'd.
 LYZR_USER_ID = os.environ.get("LYZR_USER_ID", "cerberus_dashboard")
 LYZR_CHAT_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 _lyzr_sessions: Dict[str, str] = {}  # per-browser-tab session_id, keyed by a client token
+_forensics_sessions: Dict[str, str] = {}  # separate session store — own agent, own continuity
+
+
+def _lyzr_call(agent_id: str, message: str, session_id: Optional[str] = None) -> Optional[str]:
+    """Shared low-level Lyzr Studio caller used by the 4 newer agents below.
+    Blocking (sync) — callers must run it via asyncio.to_thread. Returns
+    None on any missing-config/network/parsing failure so every caller can
+    fall back to a rule-based message without the core engine ever depending
+    on Lyzr being up."""
+    if not LYZR_API_KEY or not agent_id:
+        return None
+    try:
+        resp = requests.post(
+            LYZR_CHAT_URL,
+            headers={"accept": "application/json", "Content-Type": "application/json", "x-api-key": LYZR_API_KEY},
+            json={
+                "user_id": LYZR_USER_ID,
+                "agent_id": agent_id,
+                "session_id": session_id or str(uuid.uuid4()),
+                "message": message,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response") or data.get("agent_response")
+    except Exception:
+        return None
 
 app = FastAPI(title="Cerberus")
 
@@ -64,24 +107,6 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-
-_DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
-
-
-@app.api_route("/", methods=["GET", "HEAD"])
-def serve_dashboard():
-    """Serve the dashboard UI at the site root, so one deployed URL covers both
-    the API and the frontend (no separate static hosting / CORS setup needed).
-    Accepts HEAD too, since uptime monitors (e.g. UptimeRobot) often ping with
-    HEAD requests — a GET-only route would 405 those and get falsely marked down."""
-    return FileResponse(_DASHBOARD_PATH)
-
-
-@app.get("/healthz")
-def healthz():
-    """Cheap health-check endpoint for uptime pingers (e.g. UptimeRobot) to hit
-    every 10-14 min, keeping Render's free tier from spinning the service down."""
-    return {"status": "ok"}
 
 # ---------------------------------------------------------------------------
 # 1. SERVICE TOPOLOGY  (normal, legitimate call graph — who talks to whom)
@@ -330,6 +355,10 @@ def build_state_payload():
         "ml_layer_enabled": ml_layer_enabled,
         "lyzr_configured": bool(LYZR_API_KEY and LYZR_AGENT_ID),
         "lyzr_narrator_configured": bool(LYZR_API_KEY and LYZR_NARRATOR_AGENT_ID),
+        "lyzr_hunter_configured": bool(LYZR_API_KEY and LYZR_HUNTER_AGENT_ID),
+        "lyzr_advisor_configured": bool(LYZR_API_KEY and LYZR_ADVISOR_AGENT_ID),
+        "lyzr_policy_configured": bool(LYZR_API_KEY and LYZR_POLICY_AGENT_ID),
+        "lyzr_forensics_configured": bool(LYZR_API_KEY and LYZR_FORENSICS_AGENT_ID),
     }
 
 
@@ -1064,6 +1093,221 @@ async def analyze(req: AnalyzeRequest):
         }
     except Exception as exc:
         return {"answer": f"Ask-Cerberus hit an unexpected error: {exc}", "configured": True, "error": True}
+
+
+# ---------------------------------------------------------------------------
+# 9. THREAT HUNTER  (Lyzr agent #3) — proactive scan, no question needed.
+#    Unlike Ask-Cerberus (only answers when asked), this one looks at the
+#    live snapshot on demand and flags what it would raise to a SOC analyst.
+# ---------------------------------------------------------------------------
+def build_hunt_context() -> str:
+    lines = ["CERBERUS THREAT-HUNT SNAPSHOT", "=" * 30, "Services:"]
+    for name, s in trust_state.items():
+        status = "QUARANTINED" if s.quarantined else ("COMPROMISED" if s.compromised else "OK")
+        lines.append(f"- {name}: trust={s.score:.1f}/100, status={status}")
+    flagged = [e for e in list(event_log)[-40:] if e["kind"] in ("attack", "block")]
+    lines.append(f"\nRecent suspicious/blocked events ({len(flagged)} in last 40):")
+    for e in flagged[-15:]:
+        lines.append(f"[{e['kind'].upper()}] {e['message']}")
+    lines.append(f"\nHoneytoken hits so far: {len(honeytoken_hits)}")
+    return "\n".join(lines)
+
+
+def _rule_based_hunt_fallback() -> str:
+    low_trust = [n for n, s in trust_state.items() if s.score < 40 and not s.quarantined]
+    quarantined = [n for n, s in trust_state.items() if s.quarantined]
+    bits = []
+    if quarantined:
+        bits.append(f"{len(quarantined)} service(s) currently quarantined: {', '.join(quarantined)}.")
+    if low_trust:
+        bits.append(f"{len(low_trust)} service(s) trending low on trust: {', '.join(low_trust)}.")
+    if honeytoken_hits:
+        bits.append(f"{len(honeytoken_hits)} honeytoken hit(s) recorded — confirmed malicious activity.")
+    return " ".join(bits) if bits else "No anomalies standing out right now — system looks nominal."
+
+
+@app.get("/threat_hunt")
+async def threat_hunt():
+    """
+    Threat Hunter — proactive read of the live state. Call any time (dashboard
+    button or poll) instead of asking a specific question. Read-only, same
+    graceful-degradation pattern as the other Lyzr agents.
+    """
+    context = build_hunt_context()
+    if not LYZR_API_KEY or not LYZR_HUNTER_AGENT_ID:
+        return {"finding": _rule_based_hunt_fallback(), "configured": False}
+    prompt = (
+        "You are a proactive threat hunter for a zero-trust service mesh. "
+        "Given the live snapshot below, without being asked a specific "
+        "question, flag anything a SOC analyst should look at right now — "
+        "unusual trust drops, repeated blocks, honeytoken activity, or "
+        "services trending toward compromise. If nothing stands out, say so "
+        "briefly. Keep it to 2-4 sentences.\n\n" + context
+    )
+    answer = await asyncio.to_thread(_lyzr_call, LYZR_HUNTER_AGENT_ID, prompt)
+    if answer is None:
+        return {"finding": _rule_based_hunt_fallback(), "configured": True, "error": True}
+    return {"finding": answer, "configured": True}
+
+
+# ---------------------------------------------------------------------------
+# 10. REMEDIATION ADVISOR  (Lyzr agent #4) — one-shot, state-in/prose-out,
+#     same shape as Cerberus Narrator but a different job: a short actionable
+#     playbook for one specific service's current incident.
+# ---------------------------------------------------------------------------
+def build_advisor_context(service: str) -> Optional[str]:
+    svc = trust_state.get(service)
+    if not svc:
+        return None
+    lines = [f"CERBERUS REMEDIATION REQUEST — {service}", "=" * 30]
+    lines.append(f"Trust score: {svc.score:.1f}/100")
+    lines.append(f"Status: {'QUARANTINED' if svc.quarantined else ('COMPROMISED' if svc.compromised else 'OK')}")
+    svc_events = [e for e in list(event_log) if e.get("service") == service or service in e["message"]][-15:]
+    lines.append("\nRecent related events:")
+    for e in svc_events:
+        lines.append(f"[{e['kind'].upper()}] {e['message']}")
+    explanation = quarantine_explainer.explain(service, {
+        "trust_deficit": max(0.0, (40 - svc.score) / 40),
+        "quarantined": 1.0 if svc.quarantined else 0.0,
+        "compromised": 1.0 if svc.compromised else 0.0,
+    })
+    lines.append(f"\nExplainability breakdown: {explanation}")
+    return "\n".join(lines)
+
+
+def _rule_based_advisor_fallback(service: str) -> str:
+    svc = trust_state.get(service)
+    if not svc:
+        return "Unknown service."
+    if svc.quarantined:
+        return (f"{service} is quarantined. Standard playbook: rotate its credentials/tokens, "
+                f"audit recent outbound calls for lateral movement, patch the entry vector, "
+                f"and keep it quarantined until root cause is confirmed before manual re-verify.")
+    if svc.score < 50:
+        return f"{service}'s trust is low ({svc.score:.0f}/100). Re-verify identity and watch closely; no quarantine needed yet."
+    return f"{service} looks healthy (trust {svc.score:.0f}/100). No remediation needed."
+
+
+@app.post("/advise/{service}")
+async def advise(service: str):
+    """
+    Remediation Advisor — given one service's current incident context,
+    writes a short remediation playbook a SOC analyst could action right
+    now. Core engine untouched — this is advisory text only.
+    """
+    context = build_advisor_context(service)
+    if context is None:
+        return {"error": "unknown service"}
+    if not LYZR_API_KEY or not LYZR_ADVISOR_AGENT_ID:
+        return {"advice": _rule_based_advisor_fallback(service), "configured": False}
+    prompt = (
+        "You are a SOC remediation advisor for a zero-trust service mesh. "
+        "Given the incident context below for one service, write a short, "
+        "actionable remediation playbook (3-5 concrete steps) a SOC analyst "
+        "could execute right now. Be specific, no generic security advice.\n\n" + context
+    )
+    answer = await asyncio.to_thread(_lyzr_call, LYZR_ADVISOR_AGENT_ID, prompt)
+    if answer is None:
+        return {"advice": _rule_based_advisor_fallback(service), "configured": True, "error": True}
+    return {"advice": answer, "configured": True}
+
+
+# ---------------------------------------------------------------------------
+# 11. POLICY TUNING AGENT  (Lyzr agent #5) — one-shot advisory layer over the
+#     rule-based thresholds. Never changes config itself — the core decision
+#     path stays pure rule-based math — it only reads current constants +
+#     recent traffic and suggests tuning, same additive spirit as ml_layer.py.
+# ---------------------------------------------------------------------------
+def build_policy_context() -> str:
+    lines = ["CERBERUS POLICY REVIEW SNAPSHOT", "=" * 30]
+    lines.append("Trust decay rate: 0.15 pts/sec")
+    lines.append(f"Quarantine cooldown: {QUARANTINE_COOLDOWN_SECONDS}s, recovery trust: {QUARANTINE_RECOVERY_TRUST}")
+    lines.append(f"Rate-limit window: {RATE_WINDOW_SECONDS}s")
+    lines.append(f"Behavioral baseline window: {BASELINE_WINDOW} samples")
+    lines.append(f"Honeytoken hits total: {len(honeytoken_hits)}")
+    counts: Dict[str, int] = {}
+    for e in event_log:
+        counts[e["kind"]] = counts.get(e["kind"], 0) + 1
+    lines.append(f"\nEvent counts in current log window: {counts}")
+    quarantine_count = sum(1 for s in trust_state.values() if s.quarantined)
+    lines.append(f"Currently quarantined services: {quarantine_count}/{len(trust_state)}")
+    return "\n".join(lines)
+
+
+def _rule_based_policy_fallback() -> str:
+    return ("Rule-based check: thresholds look within normal demo ranges. Configure "
+            "LYZR_POLICY_AGENT_ID for AI-driven tuning suggestions based on live traffic.")
+
+
+@app.get("/policy_review")
+async def policy_review():
+    """
+    Policy Tuning Agent — advisory layer over the rule-based thresholds
+    (decay rate, rate-limit window, quarantine cooldown). Read-only
+    suggestion text; nothing here mutates config automatically.
+    """
+    context = build_policy_context()
+    if not LYZR_API_KEY or not LYZR_POLICY_AGENT_ID:
+        return {"suggestion": _rule_based_policy_fallback(), "configured": False}
+    prompt = (
+        "You are a security policy tuning advisor for a zero-trust service "
+        "mesh. Given the current threshold config and recent traffic stats "
+        "below, suggest whether any thresholds (trust decay rate, rate "
+        "limit window, quarantine cooldown) should be tuned, and why. Be "
+        "concise, 2-4 sentences, concrete numbers not vague advice.\n\n" + context
+    )
+    answer = await asyncio.to_thread(_lyzr_call, LYZR_POLICY_AGENT_ID, prompt)
+    if answer is None:
+        return {"suggestion": _rule_based_policy_fallback(), "configured": True, "error": True}
+    return {"suggestion": answer, "configured": True}
+
+
+# ---------------------------------------------------------------------------
+# 12. FORENSICS Q&A  (Lyzr agent #6) — chat, own session store, but sees the
+#     *historical* incident-replay timeline instead of only the live state —
+#     for after-the-fact root-cause questions ("what actually triggered the
+#     OrderService quarantine earlier?"). Distinct job from Ask-Cerberus.
+# ---------------------------------------------------------------------------
+class ForensicsRequest(BaseModel):
+    question: str
+    client_id: Optional[str] = None
+
+
+def build_forensics_context() -> str:
+    lines = ["CERBERUS INCIDENT REPLAY TIMELINE", "=" * 30]
+    labeled = [snap for snap in list(state_history)[-200:] if snap["label"]]
+    for snap in labeled[-30:]:
+        lines.append(f"t={snap['t']}: {snap['label']}")
+    lines.append("\nFull event log (most recent 60):")
+    for e in list(event_log)[-60:]:
+        lines.append(f"[{e['kind'].upper()}] {e['message']}")
+    return "\n".join(lines)
+
+
+@app.post("/forensics")
+async def forensics(req: ForensicsRequest):
+    """
+    Forensics Q&A — root-cause analysis over the historical replay timeline
+    and full event log, not just the current moment. Own session store, own
+    agent id — degrades independently of every other agent.
+    """
+    if not LYZR_API_KEY or not LYZR_FORENSICS_AGENT_ID:
+        return {
+            "answer": (
+                "Forensics Q&A isn't configured yet — set LYZR_FORENSICS_AGENT_ID "
+                "(and LYZR_API_KEY) to enable historical root-cause analysis over "
+                "the incident replay timeline."
+            ),
+            "configured": False,
+        }
+    client_id = req.client_id or "default"
+    session_id = _forensics_sessions.setdefault(client_id, str(uuid.uuid4()))
+    context = build_forensics_context()
+    message = f"{context}\n\nFORENSICS QUESTION: {req.question}"
+    answer = await asyncio.to_thread(_lyzr_call, LYZR_FORENSICS_AGENT_ID, message, session_id)
+    if answer is None:
+        return {"answer": "Couldn't reach the Forensics agent. Try again in a moment.", "configured": True, "error": True}
+    return {"answer": answer, "configured": True}
 
 
 @app.websocket("/ws")
