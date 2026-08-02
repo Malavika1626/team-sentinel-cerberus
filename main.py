@@ -27,7 +27,7 @@ import requests
 from dotenv import load_dotenv
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
+from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
 
 from ml_layer import (
@@ -100,6 +100,14 @@ def _lyzr_call(agent_id: str, message: str, session_id: Optional[str] = None) ->
         return None
 
 app = FastAPI(title="Cerberus")
+
+
+@app.get("/", include_in_schema=False)
+async def serve_dashboard():
+    """Serves the dashboard UI at the root URL so the deployed backend link
+    alone (e.g. for hackathon submission) opens the live dashboard instead
+    of a bare 404 — dashboard.html sits next to main.py in the repo root."""
+    return FileResponse("dashboard.html")
 
 app.add_middleware(
     CORSMiddleware,
