@@ -20,11 +20,13 @@ import statistics
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Dict, List, Optional
 
 import requests
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response, FileResponse
 from pydantic import BaseModel
 
 from ml_layer import (
@@ -36,10 +38,21 @@ from ml_layer import (
 )
 
 # ---------------------------------------------------------------------------
-# LYZR AGENT CONFIG  (Ask-Cerberus SOC analyst panel — set via env vars)
+# LYZR AGENT CONFIG — two independent agents, two independent jobs:
+#   1. LYZR_AGENT_ID          -> "Ask Cerberus"   interactive SOC Q&A panel
+#   2. LYZR_NARRATOR_AGENT_ID -> "Cerberus Narrator" autonomous report writer
+#      (writes the executive-summary paragraph of the incident PDF — no
+#      chat, no back-and-forth, just: state in, prose out)
+# Both are optional/env-driven; each degrades independently and doesn't
+# block the other or the core rule-based engine.
 # ---------------------------------------------------------------------------
 LYZR_API_KEY = os.environ.get("LYZR_API_KEY", "")
 LYZR_AGENT_ID = os.environ.get("LYZR_AGENT_ID", "")
+LYZR_NARRATOR_AGENT_ID = os.environ.get("LYZR_NARRATOR_AGENT_ID", "")
+# Lyzr Studio ties usage/rate-limits to a user_id tied to your account —
+# use the same email you signed up with (shown in Lyzr's own example curl
+# on the Deploy tab), not an arbitrary string, or calls get 403'd.
+LYZR_USER_ID = os.environ.get("LYZR_USER_ID", "cerberus_dashboard")
 LYZR_CHAT_URL = "https://agent-prod.studio.lyzr.ai/v3/inference/chat/"
 _lyzr_sessions: Dict[str, str] = {}  # per-browser-tab session_id, keyed by a client token
 
@@ -51,6 +64,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+_DASHBOARD_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboard.html")
+
+
+@app.get("/")
+def serve_dashboard():
+    """Serve the dashboard UI at the site root, so one deployed URL covers both
+    the API and the frontend (no separate static hosting / CORS setup needed)."""
+    return FileResponse(_DASHBOARD_PATH)
 
 # ---------------------------------------------------------------------------
 # 1. SERVICE TOPOLOGY  (normal, legitimate call graph — who talks to whom)
@@ -74,6 +96,26 @@ ALL_SERVICES = list(NORMAL_GRAPH.keys())
 HONEYTOKEN_SERVICES = {"AdminBackdoor_DB", "LegacyPaymentVault", "InternalHR_Records"}
 
 honeytoken_hits: List[dict] = []
+
+# ---------------------------------------------------------------------------
+# 1c2. MITRE ATT&CK MAPPING
+#      Ties our synthetic attack patterns to real-world ATT&CK techniques so
+#      the demo isn't just "block/allow" — it's grounded in recognized
+#      attacker tradecraft. Best-effort educational mapping, not an official
+#      MITRE-certified classification.
+# ---------------------------------------------------------------------------
+MITRE_ATTACK_MAP = {
+    "lateral_probe": {"id": "T1210", "name": "Exploitation of Remote Services", "tactic": "Lateral Movement"},
+    "credential_replay": {"id": "T1550", "name": "Use Alternate Authentication Material", "tactic": "Defense Evasion / Lateral Movement"},
+    "bulk_scrape": {"id": "T1213", "name": "Data from Information Repositories", "tactic": "Collection"},
+    "honeytoken_scan": {"id": "T1046", "name": "Network Service Discovery", "tactic": "Discovery"},
+    "compromise": {"id": "T1078", "name": "Valid Accounts", "tactic": "Initial Access / Persistence"},
+}
+
+
+def mitre_for(pattern: str) -> Optional[dict]:
+    return MITRE_ATTACK_MAP.get(pattern)
+
 
 # ---------------------------------------------------------------------------
 # 1c. AI / DATA-SCIENCE UPGRADE LAYER  (see ml_layer.py)
@@ -118,6 +160,31 @@ event_log: deque = deque(maxlen=200)
 connected_sockets: List[WebSocket] = []
 
 # ---------------------------------------------------------------------------
+# 2a2. INCIDENT REPLAY HISTORY
+#      Lightweight snapshots of every service's trust/quarantine state over
+#      time, so the dashboard can scrub back through an incident after the
+#      fact instead of only ever showing the live moment.
+# ---------------------------------------------------------------------------
+STATE_HISTORY_MAXLEN = 400
+state_history: deque = deque(maxlen=STATE_HISTORY_MAXLEN)
+
+
+def record_history_snapshot(label: str = ""):
+    """Appends a snapshot for the replay timeline. Called every decay tick
+    for a continuous baseline, plus at key moments (compromise, quarantine,
+    honeytoken hit, auto-heal, seed) with a label so the replay UI can mark
+    notable events distinctly from the ambient continuous trace."""
+    state_history.append({
+        "t": round(time.time(), 2),
+        "label": label,
+        "services": {
+            name: {"score": round(s.score, 1), "compromised": s.compromised, "quarantined": s.quarantined}
+            for name, s in trust_state.items()
+        },
+    })
+
+
+# ---------------------------------------------------------------------------
 # 2b. QUARANTINE COOLDOWN (feature 4: self-healing micro-segmentation)
 # ---------------------------------------------------------------------------
 QUARANTINE_COOLDOWN_SECONDS = 20.0
@@ -160,6 +227,7 @@ async def decay_loop():
         for svc in trust_state.values():
             if not svc.compromised:
                 svc.decay(dt)
+        record_history_snapshot()
         await broadcast_state()
 
 
@@ -175,6 +243,7 @@ def quarantine_service(name: str, reason: str, cooldown: float = QUARANTINE_COOL
         f"🔒 {name} QUARANTINED for {int(cooldown)}s — {reason}",
         {"service": name, "quarantined_until": svc.quarantined_until},
     )
+    record_history_snapshot(f"{name} quarantined — {reason}")
 
 
 async def quarantine_watchdog():
@@ -196,6 +265,7 @@ async def quarantine_watchdog():
                 )
                 changed = True
         if changed:
+            record_history_snapshot("auto-healed after cooldown")
             await broadcast_state()
 
 
@@ -249,6 +319,8 @@ def build_state_payload():
         "honeytokens": list(HONEYTOKEN_SERVICES),
         "honeytoken_hit_count": len(honeytoken_hits),
         "ml_layer_enabled": ml_layer_enabled,
+        "lyzr_configured": bool(LYZR_API_KEY and LYZR_AGENT_ID),
+        "lyzr_narrator_configured": bool(LYZR_API_KEY and LYZR_NARRATOR_AGENT_ID),
     }
 
 
@@ -439,12 +511,14 @@ async def proxy_request(req: ProxyRequest):
             f"🍯 HONEYTOKEN TRIGGERED: {req.caller} touched decoy '{req.callee}' — 100% confirmed malicious",
             {"caller": req.caller, "callee": req.callee, "reason": "honeytoken access — no legitimate service is aware this endpoint exists"},
         )
+        record_history_snapshot(f"{req.caller} honeytoken hit")
         await broadcast_state()
         return {
             "decision": "block",
             "reason": f"HONEYTOKEN TRIGGERED — {req.caller} accessed decoy service '{req.callee}'. Confidence: 100% malicious. Auto-quarantined.",
             "anomaly_score": 1.0,
             "trust": 0,
+            "mitre": mitre_for("honeytoken_scan"),
         }
 
     callee = trust_state.get(req.callee)
@@ -577,8 +651,9 @@ async def simulate_attack(req: AttackSimRequest):
         "attack",
         f"⚠ {req.compromised_service} COMPROMISED — predicted blast radius: "
         + ", ".join(r["service"] for r in radius) if radius else f"⚠ {req.compromised_service} COMPROMISED — no reachable neighbors",
-        {"blast_radius": radius, "ml_blast_radius": ml_radius},
+        {"blast_radius": radius, "ml_blast_radius": ml_radius, "mitre": mitre_for("compromise")},
     )
+    record_history_snapshot(f"{req.compromised_service} compromised")
     await broadcast_state()
 
     # Now actually attempt lateral movement calls to prove the block works
@@ -597,6 +672,7 @@ async def simulate_attack(req: AttackSimRequest):
         "blast_radius": radius,
         "ml_blast_radius": ml_radius,
         "lateral_movement_attempts": lateral_results,
+        "mitre": mitre_for("compromise"),
     }
 
 
@@ -614,7 +690,7 @@ async def simulate_honeytoken_probe(req: AttackSimRequest):
         payload_size=1500,
         hour=3,
     ))
-    return {"probed_honeytoken": decoy, **result}
+    return {"probed_honeytoken": decoy, "mitre": mitre_for("honeytoken_scan"), **result}
 
 
 @app.post("/simulate/synthetic_attack")
@@ -635,7 +711,7 @@ async def simulate_synthetic_attack(size: int = 6, seed_service: Optional[str] =
             payload_size=item["payload_size"],
             hour=item["hour"],
         ))
-        results.append({**item, **result})
+        results.append({**item, "mitre": mitre_for(item["pattern"]), **result})
     blocked = sum(1 for r in results if r["decision"] == "block")
     return {
         "burst_size": size,
@@ -687,6 +763,8 @@ async def export_report():
     """Downloadable incident report — full state snapshot, event log, and
     honeytoken hits, for post-demo review or attaching to a submission."""
     now = time.time()
+    digest = log_summarizer.summarize_with_stats(list(event_log), len(honeytoken_hits))
+    narrative = await asyncio.to_thread(_call_lyzr_narrator, build_soc_context())
     return {
         "generated_at": now,
         "system": "Cerberus — Zero-Trust Access Control for Decentralized APIs",
@@ -694,8 +772,172 @@ async def export_report():
         "services": build_state_payload()["services"],
         "full_event_log": list(event_log),
         "honeytoken_hits": honeytoken_hits,
-        "digest": log_summarizer.summarize_with_stats(list(event_log), len(honeytoken_hits)),
+        "digest": digest,
+        # AI-written executive summary (Cerberus Narrator, 2nd Lyzr agent) —
+        # falls back to the rule-based digest summary when not configured.
+        "executive_summary": narrative or digest.get("summary", "No activity recorded."),
+        "executive_summary_ai_generated": bool(narrative),
     }
+
+
+def _call_lyzr_narrator(context: str) -> Optional[str]:
+    """
+    'Cerberus Narrator' — second, independent Lyzr agent. Given the raw
+    incident state, writes a 3-5 sentence executive-summary paragraph for
+    the PDF report (the kind a SOC lead would paste into a post-mortem).
+    Distinct job from 'Ask Cerberus': no chat, no session, no follow-up
+    question — one-shot state-in / prose-out. Returns None (caller falls
+    back to the rule-based digest) if not configured or on any failure —
+    the report must always generate, LLM or not.
+    """
+    if not LYZR_API_KEY or not LYZR_NARRATOR_AGENT_ID:
+        return None
+    prompt = (
+        "You are writing the executive summary for a zero-trust security "
+        "incident report. Given the state snapshot below, write 3-5 plain "
+        "prose sentences (no headers, no bullet points) a SOC lead could "
+        "paste directly into a post-mortem: what happened, which services "
+        "were affected, and the overall severity.\n\n" + context
+    )
+    try:
+        resp = requests.post(
+            LYZR_CHAT_URL,
+            headers={"accept": "application/json", "Content-Type": "application/json", "x-api-key": LYZR_API_KEY},
+            json={
+                "user_id": LYZR_USER_ID,
+                "agent_id": LYZR_NARRATOR_AGENT_ID,
+                "session_id": str(uuid.uuid4()),  # one-shot — no continuity needed
+                "message": prompt,
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("response") or data.get("agent_response")
+    except Exception:
+        return None  # report generation must never fail because the LLM did
+
+
+def _build_pdf_report(narrative: Optional[str] = None) -> bytes:
+    """Renders the same data as /export/report as a one-page-friendly PDF —
+    handier than raw JSON to hand to judges or attach to a submission.
+    `narrative`, if given, is the Cerberus Narrator's AI-written executive
+    summary; otherwise the rule-based digest summary is used instead."""
+    from io import BytesIO
+    from reportlab.lib.pagesizes import letter
+    from reportlab.lib import colors
+    from reportlab.lib.units import inch
+    from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+    from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+    buf = BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=letter, topMargin=0.6 * inch, bottomMargin=0.6 * inch)
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle("CerberusTitle", parent=styles["Title"], textColor=colors.HexColor("#4b2aad"))
+    header_style = ParagraphStyle("CerberusHeader", parent=styles["Heading2"], textColor=colors.HexColor("#241640"),
+                                   spaceBefore=12)
+
+    def styled_table(data):
+        t = Table(data, hAlign="LEFT")
+        t.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#241640")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.white),
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+            ("FONTSIZE", (0, 0), (-1, -1), 9),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, colors.HexColor("#f2effa")]),
+        ]))
+        return t
+
+    story = [
+        Paragraph("Cerberus — Incident Report", title_style),
+        Paragraph(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", styles["Normal"]),
+        Spacer(1, 14),
+        Paragraph("Service Trust Snapshot", header_style),
+    ]
+
+    payload = build_state_payload()
+    table_data = [["Service", "Trust", "Compromised", "Quarantined"]]
+    for name, s in payload["services"].items():
+        table_data.append([name, f"{s['score']}", "yes" if s["compromised"] else "no", "yes" if s["quarantined"] else "no"])
+    story.append(styled_table(table_data))
+
+    digest = log_summarizer.summarize_with_stats(list(event_log), len(honeytoken_hits))
+    summary_header = "Executive Summary (AI-generated — Cerberus Narrator / Lyzr)" if narrative else "Activity Digest"
+    story.append(Paragraph(summary_header, header_style))
+    story.append(Paragraph(narrative or digest.get("summary", "No activity recorded."), styles["Normal"]))
+    counts = digest.get("event_counts", {})
+    if counts:
+        story.append(Spacer(1, 8))
+        story.append(styled_table([["Event Type", "Count"]] + [[k, str(v)] for k, v in counts.items()]))
+
+    story.append(Paragraph(f"Honeytoken Hits ({len(honeytoken_hits)})", header_style))
+    if honeytoken_hits:
+        hdata = [["Time", "Attacker", "Honeytoken"]]
+        for h in honeytoken_hits[-20:]:
+            hdata.append([datetime.fromtimestamp(h["ts"]).strftime("%H:%M:%S"), h["attacker"], h["honeytoken"]])
+        story.append(styled_table(hdata))
+    else:
+        story.append(Paragraph("No honeytoken hits recorded.", styles["Normal"]))
+
+    story.append(Paragraph("Recent Event Log (last 30)", header_style))
+    log_style = ParagraphStyle("LogLine", parent=styles["Normal"], fontSize=8, leading=11)
+    for e in list(event_log)[-30:]:
+        ts = datetime.fromtimestamp(e["ts"]).strftime("%H:%M:%S")
+        safe_message = e["message"].replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        story.append(Paragraph(f"[{ts}] {safe_message}", log_style))
+
+    doc.build(story)
+    return buf.getvalue()
+
+
+@app.get("/export/report_pdf")
+async def export_report_pdf():
+    """Same incident report as /export/report, rendered as a downloadable
+    PDF — a more presentable artifact for judges or a submission packet.
+    Executive summary is written live by the Cerberus Narrator (2nd Lyzr
+    agent) when configured, else falls back to the rule-based digest."""
+    narrative = await asyncio.to_thread(_call_lyzr_narrator, build_soc_context())
+    pdf_bytes = _build_pdf_report(narrative)
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"attachment; filename=cerberus_incident_report_{int(time.time())}.pdf"},
+    )
+
+
+@app.post("/seed_demo")
+async def seed_demo(count: int = 24):
+    """
+    Fires a batch of benign, realistic traffic across the real legitimate
+    call graph. Without this, the dashboard starts at a cold, empty state —
+    no trust history, no behavioral-fingerprint baselines — which looks flat
+    for the first 10-15 seconds in front of judges. Call this once right
+    after opening the dashboard, before running any attack demos.
+    """
+    fired = 0
+    for _ in range(count):
+        caller = random.choice(list(NORMAL_GRAPH.keys()))
+        callees = NORMAL_GRAPH.get(caller, {})
+        if not callees:
+            continue
+        callee = random.choices(list(callees.keys()), weights=list(callees.values()), k=1)[0]
+        payload = max(50, int(random.gauss(320, 70)))   # realistic small payload, occasional wobble
+        hour = random.choice([9, 10, 11, 13, 14, 15, 16])  # business hours
+        await proxy_request(ProxyRequest(caller=caller, callee=callee, payload_size=payload, hour=hour))
+        fired += 1
+    record_history_snapshot("seed demo traffic fired")
+    log_event("info", f"🌱 Seed demo — fired {fired} benign requests to warm up trust/baselines")
+    await broadcast_state()
+    return {"seeded": True, "requests_fired": fired}
+
+
+@app.get("/history")
+async def get_history(limit: int = 200):
+    """Incident Replay timeline — a series of past trust/quarantine snapshots
+    the dashboard can scrub back through after an attack, instead of only
+    ever showing the live moment."""
+    data = list(state_history)[-limit:]
+    return {"history": data, "count": len(data)}
 
 
 @app.post("/reset")
@@ -711,6 +953,7 @@ async def reset():
         q.clear()
     event_log.clear()
     honeytoken_hits.clear()
+    state_history.clear()
     behavioral_ml_model.history.clear()
     behavioral_ml_model.models.clear()
     behavioral_ml_model.last_call_ts.clear()
@@ -776,23 +1019,42 @@ async def analyze(req: AnalyzeRequest):
     context = build_soc_context()
     message = f"{context}\n\nANALYST QUESTION: {req.question}"
 
-    try:
+    def _call_lyzr():
         resp = requests.post(
             LYZR_CHAT_URL,
             headers={"accept": "application/json", "Content-Type": "application/json", "x-api-key": LYZR_API_KEY},
             json={
-                "user_id": "cerberus_dashboard",
+                "user_id": LYZR_USER_ID,
                 "agent_id": LYZR_AGENT_ID,
                 "session_id": session_id,
                 "message": message,
             },
             timeout=20,
         )
-        data = resp.json()
+        resp.raise_for_status()
+        return resp.json()
+
+    try:
+        # requests is blocking (sync) — run it in a worker thread so it doesn't
+        # freeze the asyncio event loop (WS broadcasts, decay loop, other
+        # requests) for every connected client while we wait on Lyzr.
+        data = await asyncio.to_thread(_call_lyzr)
         answer = data.get("response") or data.get("agent_response") or str(data)
         return {"answer": answer, "configured": True}
+    except requests.exceptions.Timeout:
+        return {
+            "answer": "Ask-Cerberus timed out waiting on the Lyzr agent. Try again in a moment.",
+            "configured": True,
+            "error": True,
+        }
+    except requests.exceptions.RequestException as exc:
+        return {
+            "answer": f"Couldn't reach the Lyzr agent: {exc}",
+            "configured": True,
+            "error": True,
+        }
     except Exception as exc:
-        return {"answer": f"Lyzr agent call failed: {exc}", "configured": True, "error": True}
+        return {"answer": f"Ask-Cerberus hit an unexpected error: {exc}", "configured": True, "error": True}
 
 
 @app.websocket("/ws")
