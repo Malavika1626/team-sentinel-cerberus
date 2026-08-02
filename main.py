@@ -5,7 +5,7 @@ Core innovation beyond standard zero-trust proxies:
   1. Trust Decay      -> trust score drains over time like a battery,
                           forcing periodic re-verification (shrinks attacker window)
   2. Blast Radius      -> predicts which services WOULD be compromised next,
-                          BEFORE the attacker actually reaches them (graph propagation)
+                          BEFORE the attacker actually reaches them (graph propagation) 
   3. Explainable Block -> every allow/block decision returns a human-readable reason
 
 Run:  uvicorn main:app --reload --port 8000
