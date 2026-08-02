@@ -74,6 +74,13 @@ def serve_dashboard():
     the API and the frontend (no separate static hosting / CORS setup needed)."""
     return FileResponse(_DASHBOARD_PATH)
 
+
+@app.get("/healthz")
+def healthz():
+    """Cheap health-check endpoint for uptime pingers (e.g. UptimeRobot) to hit
+    every 10-14 min, keeping Render's free tier from spinning the service down."""
+    return {"status": "ok"}
+
 # ---------------------------------------------------------------------------
 # 1. SERVICE TOPOLOGY  (normal, legitimate call graph — who talks to whom)
 # ---------------------------------------------------------------------------
